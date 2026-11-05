@@ -7,9 +7,12 @@ standard library, so it works on any distro without a build step.
 - **Tabs are notes.** Each "Untitled" tab is a note that saves itself 2 seconds
   after you stop typing, and again when you switch tabs or quit. Tabs, their
   order, and the cursor position are restored on the next launch.
-- **Files open in tabs too.** Ctrl+O opens a file. Ctrl+S saves it. Ctrl+S on a
-  note asks for a path and turns the note into that file, the same as DMS's
-  "Save as".
+- **Files open in tabs too.** Ctrl+O opens a file and Ctrl+S saves it. On a
+  note, Ctrl+S saves it where it already is, in the notes folder. Alt+S ("Save
+  as a file") turns a note into a file somewhere else, like DMS's "Save as".
+- **You choose where new notes go.** Set `notes_dir` in the config (or use
+  `--dir` for one run). Existing notes stay in their folder and keep saving
+  there; only notes created afterwards go to the new folder.
 - **Unsaved changes are kept.** If you quit or close the terminal (SIGHUP/SIGTERM),
   notes are saved, and unsaved edits to opened files are restored when you
   relaunch.
@@ -104,6 +107,7 @@ konsole -e tuinotepad      # or: alacritty -e tuinotepad, kitty tuinotepad, ...
 git pull                              # updates a symlinked install; re-run `install` if you copied it
 rm ~/.local/bin/tuinotepad            # uninstall the command
 rm -r ~/.local/state/tuinotepad ~/.config/tuinotepad   # also delete notes and config
+                                      # (plus your notes_dir folder, if you set one)
 ```
 
 ## Usage
@@ -113,34 +117,118 @@ tuinotepad [FILE...]          open files in tabs
 cmd | tuinotepad              open piped text as a new note
 tuinotepad --new "text"       add a note and exit (a running instance shows it)
 tuinotepad --list             list tabs
-tuinotepad --dms              use DankMaterialShell's notepad storage
-tuinotepad --dir DIR          use a different storage directory
+tuinotepad --dir DIR          create new notes in DIR for this run (see Storage)
 ```
 
-Press **F1** (or Ctrl+G) in the app for every key. The defaults:
+To share notes with DankMaterialShell's notepad, see
+[Sharing notes with DankMaterialShell](#sharing-notes-with-dankmaterialshell).
 
-| | |
+Press **F1** (or Ctrl+G) in the app to see every key. The help screen uses
+three columns on wide terminals (170+ columns), two from 112 columns, and one
+scrolling column below that. The defaults:
+
+**Tabs**
+
+| Key | Action |
 |---|---|
 | Ctrl+N / Ctrl+T | new note |
-| Ctrl+W, Alt+U | close tab, reopen it |
-| Ctrl+PgUp/PgDn, Alt+←/→ | previous/next tab |
-| Alt+1…9 | jump to tab (9 = last) |
-| Ctrl+Shift+PgUp/PgDn, Alt+Shift+←/→ | move tab |
-| F2 / Ctrl+R, double-click tab | rename |
-| Ctrl+S, Alt+S, Ctrl+O | save, save as, open |
-| Ctrl+F, F3 / Shift+F3 | find, next/previous |
-| Ctrl+Z / Ctrl+Y | undo / redo |
-| Ctrl+A, Ctrl+C/X/V | select all, system clipboard (wl-copy / xclip / xsel, then OSC 52) |
-| Shift+arrows, mouse drag, Ctrl+Space then arrows | select |
-| Ctrl+K, Ctrl+D, Alt+↑/↓ | delete, duplicate, move line |
-| Tab / Shift+Tab | indent / outdent the selected lines |
-| Alt+L, Alt+T, Alt+A, Alt+I | line numbers, theme, autosave for opened files, show path |
-| Ctrl+Q | quit (nothing is lost) |
+| Ctrl+W | close tab (notes go to the trash) |
+| Alt+U | reopen the last closed tab |
+| Ctrl+PgUp/PgDn, Alt+←/→ | previous / next tab |
+| Alt+1 … Alt+8, Alt+9 | go to tab 1–8, last tab |
+| Ctrl+Shift+PgUp/PgDn, Alt+Shift+←/→ | move tab left / right |
+| F2 / Ctrl+R | rename tab |
 
-Mouse: click a tab to switch to it, middle-click to close it, and use the
-scroll wheel over the tab bar to cycle through tabs. Click or drag in the text
-to place the cursor or select, and double- or triple-click to select a word or
-a line.
+**Files**
+
+| Key | Action |
+|---|---|
+| Ctrl+S | save (a note is saved where it already is) |
+| Alt+S | save as a file elsewhere (a note becomes that file) |
+| Ctrl+O | open a file in a new tab |
+| Tab | complete the path in the Open / Save as prompt |
+| Alt+R / Alt+K | file changed on disk: reload it / keep your version |
+
+**Copy and paste**
+
+| Key | Action |
+|---|---|
+| Ctrl+C / Ctrl+X | copy / cut the selection (wl-copy, xclip or xsel; otherwise OSC 52) |
+| Ctrl+V | paste from the system clipboard |
+| Ctrl+A | select all |
+| Ctrl+Shift+V | paste through the terminal (bracketed paste, undone in one step) |
+
+**Selecting**
+
+| Key | Action |
+|---|---|
+| Shift+arrows, Shift+Home/End, Shift+PgUp/PgDn | extend the selection |
+| Ctrl+Shift+←/→ | select word by word |
+| Ctrl+Space, then move | start selecting without Shift (useful in Yakuake) |
+| Mouse drag, double / triple click | select text, a word, a line |
+| Esc | clear the selection |
+| Shift+drag | the terminal's own selection |
+
+**Moving**
+
+| Key | Action |
+|---|---|
+| Arrows, Ctrl+←/→ | move the cursor; by word |
+| Home / End | line start (first press goes to the indentation) / end |
+| Ctrl+Home / Ctrl+End | start / end of the note |
+| PgUp / PgDn | page up / down |
+| Ctrl+↑/↓, mouse wheel | scroll without moving the cursor |
+
+**Editing**
+
+| Key | Action |
+|---|---|
+| Ctrl+Z / Ctrl+Y | undo / redo |
+| Backspace / Del | delete a character |
+| Alt+Backspace | delete the word before the cursor |
+| Ctrl+Del / Alt+Del | delete the word after the cursor |
+| Ctrl+K / Ctrl+D | delete / duplicate the line |
+| Alt+↑/↓ | move the line (or selected lines) up / down |
+| Tab / Shift+Tab | indent / outdent (the selected lines) |
+
+**Find**
+
+| Key | Action |
+|---|---|
+| Ctrl+F | find in this note (matches as you type; uppercase makes it case-sensitive) |
+| F3 / Shift+F3 | next / previous match |
+| ↓ or Enter / ↑ | next / previous match, inside the find bar |
+| Esc | close the find bar (the current match stays selected) |
+
+**Mouse**
+
+| Action | Result |
+|---|---|
+| Click / middle-click / double-click a tab | switch to it / close it / rename it |
+| Click `+` | new note |
+| Wheel over the tab bar | cycle through tabs |
+| Click in the text | place the cursor |
+
+**Prompts and dialogs**
+
+| Key | Action |
+|---|---|
+| Enter / Esc | confirm / cancel |
+| Ctrl+U | clear the input field |
+| y / n / c | yes / no / cancel |
+| Esc | dismiss the changed-on-disk banner |
+
+**View and app**
+
+| Key | Action |
+|---|---|
+| Alt+L | toggle line numbers |
+| Alt+T | next color theme |
+| Alt+A | toggle autosave for opened files |
+| Alt+I | show the file path in the status bar |
+| Ctrl+L | redraw the screen |
+| F1 / Ctrl+G | help (↑/↓ scroll it, any other key closes) |
+| Ctrl+Q | quit (nothing is lost) |
 
 **Yakuake/Konsole:** Shift+←/→ switch Yakuake's own tabs by default, so
 the app never sees them. Select with Ctrl+Space and the arrow keys, Shift+↑/↓,
@@ -161,7 +249,7 @@ The config file, `~/.config/tuinotepad/config.json`, is created on first run:
   "tab_width": 4,
   "auto_title": true,           // show an Untitled note's first line as its tab title
   "confirm_close": true,
-  "escape_hides_yakuake": false,// Esc with nothing to cancel toggles Yakuake via qdbus (untested)
+  "notes_dir": "",              // where new notes go; "" = ~/.local/state/tuinotepad/notepad-files
   "keys": {"next_tab": ["alt+right", "ctrl+pgdn"]}
 }
 ```
@@ -170,18 +258,89 @@ The config file, `~/.config/tuinotepad/config.json`, is created on first run:
 names look like `ctrl+shift+pgdn`, `alt+x`, `f2`, `ctrl+space`. Action names
 are listed in the `ACTIONS` table at the top of the script.
 
+The config is checked at startup. Unknown settings, values of the wrong type
+(e.g. `"line_numbers": "yes"`), unknown theme names and unknown key actions are
+removed from the file, and a popup lists exactly what was changed. Valid
+settings are kept. If the file isn't valid JSON at all (say, half-edited), the
+app warns, uses the defaults for that run, and leaves the file untouched.
+
 ## Storage
 
-Notes are stored in `~/.local/state/tuinotepad/` (or `$XDG_STATE_HOME`):
+The session (the tab list) and the app's own bookkeeping live in
+`~/.local/state/tuinotepad/` (or `$XDG_STATE_HOME/tuinotepad`):
 
 ```
 notepad-session.json    tab list: same format as DMS (version 1)
-notepad-files/          one untitled-<id>.txt per note
+notepad-files/          default folder for notes: one untitled-<id>.txt each
 notepad-trash/          closed notes
 notepad-recovery/       unsaved edits to opened files
 ```
 
-`--dms` points it at `~/.local/state/DankMaterialShell`, so it shares notes with
-DMS. DMS only reads the tab list when its notepad is first loaded and
-overwrites it when it changes something itself. Avoid restructuring tabs (new,
-close, reorder) in both at the same time.
+**Choosing where notes go.** `notes_dir` in the config sets the folder for new
+notes, permanently. `--dir DIR` does the same for a single run. A relative
+`notes_dir` is relative to your home folder; a relative `--dir` is relative to
+the current folder.
+
+Each note remembers its own file. Changing the folder only affects notes created
+afterwards:
+
+- Notes you already have stay in their old folder, keep saving there, and stay
+  in your tabs.
+- New notes are created in the new folder and keep saving there, even if you
+  change the folder again later.
+- Nothing is copied or moved. To move a note, use Alt+S (save it as a file
+  wherever you like).
+
+The F1 help footer shows the current folder for new notes. Alt+I shows the file
+of the note you're looking at.
+
+## Sharing notes with DankMaterialShell
+
+tuinotepad stores notes the same way DMS's notepad does, so both can use the
+same notes and tabs. DMS keeps its notepad in `~/.local/state/DankMaterialShell`.
+To share it, make tuinotepad's state folder a link to that folder.
+
+Setting `notes_dir` to DMS's folder is **not** enough. That only changes where
+note *files* go. DMS finds notes through its tab list (`notepad-session.json`),
+and tuinotepad would keep using its own.
+
+1. Quit tuinotepad, then move its current folder aside (skip this if you've
+   never run it):
+
+   ```sh
+   mv ~/.local/state/tuinotepad ~/.local/state/tuinotepad.bak
+   ```
+
+2. Link tuinotepad's folder to DMS's:
+
+   ```sh
+   ln -s ~/.local/state/DankMaterialShell ~/.local/state/tuinotepad
+   ```
+
+3. Keep `"notes_dir": ""` in `~/.config/tuinotepad/config.json`. Notes in any
+   other folder are saved with a full path, which DMS can't open.
+
+4. Run `tuinotepad`. It now shows DMS's tabs, and notes you create in either
+   app appear in the other.
+
+**Your old tuinotepad notes** are still in
+`~/.local/state/tuinotepad.bak/notepad-files/`. Open any of them with Ctrl+O, or
+copy their text into new notes.
+
+**To stop sharing,** remove the link (without a trailing `/`, so only the link
+is removed and DMS's folder is untouched) and move your old folder back:
+
+```sh
+rm ~/.local/state/tuinotepad
+mv ~/.local/state/tuinotepad.bak ~/.local/state/tuinotepad
+```
+
+**While sharing:**
+- Edits made in one app show up in the other: tuinotepad checks for changes
+  every second, and DMS re-reads the current note each time its notepad is
+  shown.
+- DMS reads the tab list only when its notepad first loads, and overwrites it
+  when it changes tabs itself. Avoid adding, closing or reordering tabs in both
+  apps at once, or one app's tab changes can undo the other's.
+- tuinotepad also adds its own `notepad-trash/` and `notepad-recovery/` folders
+  next to DMS's files. DMS ignores them.

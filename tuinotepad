@@ -6,7 +6,7 @@ that saves itself, tabs survive restarts, and real files can be opened in
 tabs next to the notes. Single file, Python 3.8+ standard library only.
 
 Storage uses the same layout as DMS (notepad-session.json + notepad-files/),
-so `--dms` can share notes with a running DankMaterialShell.
+so it can share notes with DankMaterialShell (see the README).
 """
 
 import argparse
@@ -40,7 +40,6 @@ STATE_HOME = _xdg("XDG_STATE_HOME", "~/.local/state")
 CONFIG_HOME = _xdg("XDG_CONFIG_HOME", "~/.config")
 CACHE_HOME = _xdg("XDG_CACHE_HOME", "~/.cache")
 DEFAULT_DIR = os.path.join(STATE_HOME, APP)
-DMS_DIR = os.path.join(STATE_HOME, "DankMaterialShell")
 DMS_COLORS = os.path.join(CACHE_HOME, "DankMaterialShell", "dms-colors.json")
 CONFIG_PATH = os.path.join(CONFIG_HOME, APP, "config.json")
 
@@ -109,8 +108,8 @@ DEFAULT_CONFIG = {
     "tab_width": 4,
     "auto_title": True,           # show an "Untitled" note's first line as its tab title
     "confirm_close": True,        # ask before closing a note that has content
-    "escape_hides_yakuake": False,  # Esc with nothing to cancel toggles Yakuake (like Esc hiding DMS's notepad)
-    "keys": {},                   # {"action": ["ctrl+x", ...]} overrides, see --help-keys
+    "notes_dir": "",              # where NEW notes are created ("" = <state dir>/notepad-files)
+    "keys": {},                   # {"action": ["ctrl+x", ...]} key overrides
 }
 
 ACTIONS = [
@@ -123,8 +122,8 @@ ACTIONS = [
     ("move_tab_right", ["ctrl+shift+pgdn", "alt+shift+right"], "Move tab right"),
     ("move_tab_left", ["ctrl+shift+pgup", "alt+shift+left"], "Move tab left"),
     ("rename_tab", ["f2", "ctrl+r"], "Rename tab"),
-    ("save", ["ctrl+s"], "Save (a note asks for a file path)"),
-    ("save_as", ["alt+s"], "Save as..."),
+    ("save", ["ctrl+s"], "Save"),
+    ("save_as", ["alt+s"], "Save as a file elsewhere..."),
     ("open", ["ctrl+o"], "Open file in a new tab"),
     ("find", ["ctrl+f"], "Find"),
     ("find_next", ["f3"], "Find next"),
@@ -168,21 +167,70 @@ def normalize_keyname(name):
     return "+".join(mods + [base])
 
 
+def _config_problem(key, value):
+    """Why `value` isn't valid for `key`, or None if it is."""
+    default = DEFAULT_CONFIG[key]
+    if isinstance(default, bool):
+        return None if isinstance(value, bool) else "must be true or false"
+    if key == "tab_width":
+        ok = isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 16
+        return None if ok else "must be a whole number from 1 to 16"
+    if key == "autosave_delay":
+        ok = isinstance(value, (int, float)) and not isinstance(value, bool) and 0.2 <= value <= 60
+        return None if ok else "must be a number of seconds from 0.2 to 60"
+    if key == "theme":
+        return None if value in THEME_ORDER else "must be one of: " + ", ".join(THEME_ORDER)
+    if key == "notes_dir":
+        return None if isinstance(value, str) else "must be a path (string)"
+    if key == "keys":
+        return None if isinstance(value, dict) else 'must be an object like {"next_tab": ["alt+right"]}'
+    return None
+
+
 def load_config():
+    """Load config.json, keeping only known, valid settings.
+
+    Anything unknown or invalid is reported and removed from the file, so a typo
+    never silently does nothing."""
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    warning = None
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             user = json.load(f)
-        if isinstance(user, dict):
-            for k, v in user.items():
-                if k in cfg:
-                    cfg[k] = v
     except FileNotFoundError:
         save_config(cfg)
-    except (OSError, ValueError) as e:
-        warning = "config.json ignored: %s" % e
-    return cfg, warning
+        return cfg, []
+    except ValueError as e:
+        # Don't overwrite a file the user is halfway through editing.
+        return cfg, ["%s is not valid JSON (%s); using defaults" % (shorten_home(CONFIG_PATH), e)]
+    except OSError as e:
+        return cfg, ["cannot read %s: %s; using defaults" % (shorten_home(CONFIG_PATH), e.strerror)]
+    if not isinstance(user, dict):
+        return cfg, ["%s must contain a JSON object; using defaults" % shorten_home(CONFIG_PATH)]
+    problems = []
+    for key, value in user.items():
+        if key not in DEFAULT_CONFIG:
+            problems.append("removed unknown setting \"%s\"" % key)
+            continue
+        why = _config_problem(key, value)
+        if why:
+            problems.append("\"%s\" %s; reset to default" % (key, why))
+            continue
+        cfg[key] = value
+    known_actions = {a for a, _, _ in ACTIONS}
+    clean_keys = {}
+    for act, keys in cfg["keys"].items():
+        if act not in known_actions:
+            problems.append("removed unknown key action \"%s\"" % act)
+            continue
+        keys = [keys] if isinstance(keys, str) else keys
+        if not isinstance(keys, list) or not all(isinstance(k, str) and normalize_keyname(k) for k in keys):
+            problems.append("keys.%s must be a key name or a list of key names; removed" % act)
+            continue
+        clean_keys[act] = keys
+    cfg["keys"] = clean_keys
+    if problems or set(DEFAULT_CONFIG) - set(user):
+        save_config(cfg)          # rewrite with exactly the known settings
+    return cfg, problems
 
 
 def save_config(cfg):
@@ -278,25 +326,38 @@ def shorten_home(p):
 # --------------------------------------------------------------------------
 
 class Storage:
-    def __init__(self, base):
+    """Session state lives in `base`; new notes are created in `notes_dir`.
+
+    Each note remembers its own file, so changing notes_dir only affects notes
+    created afterwards: older notes stay (and keep saving) where they are.
+    Notes inside <base>/notepad-files are stored with a relative path, exactly
+    like DMS; notes anywhere else are stored with an absolute path."""
+
+    def __init__(self, base, notes_dir=None):
         self.base = base
-        self.files_dir = os.path.join(base, "notepad-files")
+        self.default_notes_dir = os.path.join(base, "notepad-files")
+        self.notes_dir = notes_dir or self.default_notes_dir
         self.meta_path = os.path.join(base, "notepad-session.json")
         self.trash_dir = os.path.join(base, "notepad-trash")
         self.recovery_dir = os.path.join(base, "notepad-recovery")
         self.meta_sig = None
-        os.makedirs(self.files_dir, exist_ok=True)
+        os.makedirs(base, exist_ok=True)
+        os.makedirs(self.notes_dir, exist_ok=True)
 
     def full_path(self, tab):
-        if tab.get("isTemporary"):
-            return os.path.join(self.base, tab.get("filePath", ""))
-        return tab.get("filePath", "")
+        path = tab.get("filePath", "")
+        if tab.get("isTemporary") and not os.path.isabs(path):
+            return os.path.join(self.base, path)
+        return path
 
     def make_note_tab(self, title=UNTITLED):
         tid = new_tab_id()
-        rel = "notepad-files/untitled-%d.txt" % tid
-        open(os.path.join(self.base, rel), "a").close()
-        return {"id": tid, "title": title, "filePath": rel, "isTemporary": True,
+        os.makedirs(self.notes_dir, exist_ok=True)
+        full = os.path.join(self.notes_dir, "untitled-%d.txt" % tid)
+        open(full, "a").close()
+        rel = os.path.relpath(full, self.base)
+        stored = rel if os.path.dirname(full) == self.default_notes_dir else full
+        return {"id": tid, "title": title, "filePath": stored, "isTemporary": True,
                 "lastModified": iso_now(), "cursorPosition": 0, "scrollPosition": 0}
 
     @staticmethod
@@ -396,6 +457,31 @@ def clip(s, maxw, ellipsis="…"):
         out.append(c)
         w += cw
     return "".join(out) + ellipsis
+
+
+def wrap_words(text, width):
+    """Break text at spaces into lines of at most `width` columns."""
+    lines, cur = [], ""
+    for word in text.split(" "):
+        cand = word if not cur else cur + " " + word
+        if cur and text_width(cand) > width:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = cand
+    lines.append(cur)
+    out = []
+    for line in lines:                 # hard-break anything still too wide (long paths)
+        while text_width(line) > width > 0:
+            cut, w = 0, 0
+            while cut < len(line) and w + char_width(line[cut]) <= width:
+                w += char_width(line[cut])
+                cut += 1
+            cut = max(cut, 1)
+            out.append(line[:cut])
+            line = line[cut:]
+        out.append(line)
+    return out
 
 
 def is_word(ch):
@@ -869,7 +955,7 @@ def pretty_key(k):
 
 
 class App:
-    def __init__(self, scr, storage, cfg, cfg_warning, open_files, stdin_text, cwd):
+    def __init__(self, scr, storage, cfg, warnings, open_files, stdin_text, cwd):
         self.scr = scr
         self.st = storage
         self.cfg = cfg
@@ -894,6 +980,7 @@ class App:
         self.msg = None            # (text, level, expires)
         self.show_path = False
         self.help_scroll = 0
+        self.notice = None         # (title, lines) popup shown at startup
         self.follow = True
         self.quit = False
         self.stop_signal = False
@@ -918,8 +1005,10 @@ class App:
             self.tabs.append(tab)
             self.cur = len(self.tabs) - 1
             self.save_meta()
-        if cfg_warning:
-            self.message(cfg_warning, "error")
+        if warnings:
+            self.notice = ("Settings fixed in %s" % shorten_home(CONFIG_PATH),
+                           ["• " + w for w in warnings])
+            self.mode = "notice"
         self.st.purge_trash()
         self.set_terminal_title()
 
@@ -1016,7 +1105,7 @@ class App:
             self.message("Could not save session: %s" % e, "error")
 
     def sync_meta(self):
-        """Pick up tab changes made by another instance (or by DMS with --dms)."""
+        """Pick up tab changes made by another instance (or by DMS, when sharing its folder)."""
         if not self.st.meta_changed():
             return
         res = self.st.load_meta()
@@ -1290,7 +1379,11 @@ class App:
 
     def save(self):
         if self.tab.get("isTemporary"):
-            return self.save_as()
+            # A note already lives in the notes folder: save it right there.
+            # (Alt+S "Save as file" turns it into a file somewhere else.)
+            if self.save_note(self.tab, self.doc):
+                self.message("Saved %s" % shorten_home(self.st.full_path(self.tab)), "ok")
+            return
         self.save_file(self.tab, self.doc)
 
     def save_as(self):
@@ -1333,7 +1426,7 @@ class App:
             if os.path.exists(path) and path != tab.get("filePath"):
                 return self.ask("%s exists. Overwrite? [y/N]" % shorten_home(path), {"y": lambda: write(path)})
             write(path)
-        self.ask_text("Save as:", default, done, complete=True)
+        self.ask_text("Save as file:", default, done, complete=True)
 
     def open_file(self):
         def done(text):
@@ -1664,7 +1757,9 @@ class App:
             self.draw_status(H - 1, W)
         if self.mode == "help":
             self.draw_help(H, W)
-        if self.cursor_screen and self.mode != "help":
+        elif self.mode == "notice":
+            self.draw_notice(H, W)
+        if self.cursor_screen and self.mode not in ("help", "notice"):
             try:
                 curses.curs_set(1)
                 scr.move(*self.cursor_screen)
@@ -1868,56 +1963,189 @@ class App:
             self.put(y, W - info_w - 1, info, A["bar_dim"])
         self.cursor_screen = (y, lx + text_width(before[skip:]))
 
-    def help_lines(self):
-        sections = [
-            ("Tabs", ["new_tab", "close_tab", "reopen_tab", "next_tab", "prev_tab", "tab_1", "tab_9",
-                      "move_tab_left", "move_tab_right", "rename_tab"]),
-            ("Files", ["save", "save_as", "open", "reload_disk", "keep_mine"]),
-            ("Editing", ["undo", "redo", "select_all", "copy", "cut", "paste", "mark", "delete_line",
-                         "duplicate_line", "move_line_up", "move_line_down", "find", "find_next", "find_prev"]),
-            ("View", ["toggle_line_numbers", "cycle_theme", "toggle_autosave", "toggle_path", "redraw", "help", "quit"]),
+    def draw_notice(self, H, W):
+        A = self.attr
+        title, items = self.notice
+        bw = min(W - 2, 90)
+        lines = []
+        for item in items:
+            wrapped = wrap_words(item, bw - 6)
+            lines += [wrapped[0]] + ["  " + l for l in wrapped[1:]]
+        lines += ["", "Press any key to continue."]
+        bh = min(H - 2, len(lines) + 3)
+        x0, y0 = (W - bw) // 2, (H - bh) // 2
+        for r in range(bh):
+            self.fill(y0 + r, x0, bw, A["box"])
+        self.put(y0, x0 + 2, clip(" %s " % title, bw - 4), A["box_title"])
+        for i, line in enumerate(lines[:bh - 3]):
+            self.put(y0 + 2 + i, x0 + 3, clip(line, bw - 6), A["box_dim"] if i == len(lines) - 1 else A["box"])
+
+    def help_sections(self):
+        """Every key the app understands. Configurable ones come from the live keymap."""
+        def keys(a):
+            return [pretty_key(k) for k in self.action_keys.get(a, [])]
+
+        def act(a, desc=None):
+            return (keys(a) or ["(unbound)"], desc or ACTION_DESC[a])
+
+        def pair(a, b, desc):
+            out = []
+            for ka, kb in zip(keys(a), keys(b)):
+                pa, _, ba = ka.rpartition("+")
+                pb, _, bb = kb.rpartition("+")
+                out.append("%s+%s/%s" % (pa, ba, bb) if pa and pa == pb else "%s / %s" % (ka, kb))
+            return (out or ["(unbound)"], desc)
+
+        first = lambda a: (keys(a) or ["?"])[0]
+        return [
+            ("Tabs", [
+                act("new_tab"), act("close_tab", "Close tab (to trash)"), act("reopen_tab"),
+                pair("prev_tab", "next_tab", "Previous / next tab"),
+                (["%s … %s" % (first("tab_1"), first("tab_8"))], "Go to tab 1–8"),
+                act("tab_9"),
+                pair("move_tab_left", "move_tab_right", "Move tab left / right"),
+                act("rename_tab"),
+            ]),
+            ("Files", [
+                act("save", "Save (notes stay in place)"), act("save_as"), act("open"),
+                (["Tab"], "Complete path (open/save)"),
+                act("reload_disk", "Changed on disk: reload it"),
+                act("keep_mine", "Changed on disk: keep mine"),
+            ]),
+            ("Copy & paste", [
+                act("copy", "Copy selection"), act("cut", "Cut selection"),
+                act("paste", "Paste from clipboard"), act("select_all"),
+                (["Ctrl+Shift+V"], "Paste through the terminal"),
+            ]),
+            ("Selecting", [
+                (["Shift+arrows", "Shift+Home/End", "Shift+PgUp/PgDn"], "Extend the selection"),
+                (["Ctrl+Shift+←/→"], "Select word by word"),
+                act("mark", "Start selecting, then move"),
+                (["Mouse drag"], "Select with the mouse"),
+                (["Double / triple click"], "Select word / line"),
+                (["Esc"], "Clear the selection"),
+                (["Shift+drag"], "Terminal's own selection"),
+            ]),
+            ("Moving", [
+                (["Arrows"], "Move the cursor"),
+                (["Ctrl+←/→"], "Word left / right"),
+                (["Home / End"], "Line start / end"),
+                (["Ctrl+Home/End"], "Start / end of the note"),
+                (["PgUp/PgDn"], "Page up / down"),
+                (["Ctrl+↑/↓", "Mouse wheel"], "Scroll, cursor stays put"),
+            ]),
+            ("Editing", [
+                act("undo"), act("redo"),
+                (["Backspace / Del"], "Delete a character"),
+                (["Alt+Backspace"], "Delete word before cursor"),
+                (["Ctrl+Del", "Alt+Del"], "Delete word after cursor"),
+                act("delete_line"), act("duplicate_line"),
+                pair("move_line_up", "move_line_down", "Move line(s) up / down"),
+                (["Tab / Shift+Tab"], "Indent / outdent lines"),
+            ]),
+            ("Find", [
+                act("find", "Find in this note"),
+                pair("find_next", "find_prev", "Next / previous match"),
+                (["↓ / Enter", "↑"], "Next / previous (find bar)"),
+                (["Esc"], "Close, keep match selected"),
+            ]),
+            ("Mouse", [
+                (["Click tab"], "Switch to it"),
+                (["Middle-click tab"], "Close it"),
+                (["Double-click tab"], "Rename it"),
+                (["Click +"], "New note"),
+                (["Wheel on tab bar"], "Cycle through tabs"),
+                (["Click text"], "Place the cursor"),
+            ]),
+            ("Prompts & dialogs", [
+                (["Enter / Esc"], "Confirm / cancel"),
+                (["Ctrl+U"], "Clear the field"),
+                (["y / n / c"], "Yes / no / cancel"),
+                (["Esc"], "Dismiss the disk banner"),
+            ]),
+            ("View & app", [
+                act("toggle_line_numbers"), act("cycle_theme"),
+                act("toggle_autosave", "Autosave opened files"),
+                act("toggle_path"), act("redraw"), act("help"), act("quit"),
+            ]),
         ]
-        out = []
-        for title, acts in sections:
-            out.append(("title", title, ""))
-            for a in acts:
-                ks = " / ".join(pretty_key(k) for k in self.action_keys.get(a, [])) or "(unbound)"
-                out.append(("row", ks, ACTION_DESC[a]))
-            if title == "Editing":
-                out.append(("row", "Shift+arrows, mouse drag", "Select (or Ctrl+Space, then arrows)"))
-                out.append(("row", "Ctrl+←/→, Alt+Backspace", "Word left/right, delete word"))
-                out.append(("row", "Tab / Shift+Tab", "Indent / outdent selected lines"))
-            out.append(("gap", "", ""))
-        out.append(("dim", "Notes save automatically. Unsaved edits to files are kept across restarts.", ""))
-        out.append(("dim", "Storage: %s   Config: %s" % (shorten_home(self.st.base), shorten_home(CONFIG_PATH)), ""))
-        return out
+
+    @staticmethod
+    def help_column(sections, kw):
+        """Lay sections out as lines; key lists wrap inside the key column."""
+        lines = []
+        for title, rows in sections:
+            if lines:
+                lines.append(("blank",))
+            lines.append(("title", title))
+            for key_list, desc in rows:
+                chunks, cur = [], ""
+                for k in key_list:
+                    cand = k if not cur else cur + ", " + k
+                    if cur and text_width(cand) > kw:
+                        chunks.append(cur + ",")
+                        cur = k
+                    else:
+                        cur = cand
+                chunks.append(cur)
+                lines.append(("row", chunks[0], desc))
+                lines.extend(("row", c, "") for c in chunks[1:])
+        return lines
 
     def draw_help(self, H, W):
         A = self.attr
-        lines = self.help_lines()
-        bw = min(W - 2, 84)
-        bh = min(H - 2, len(lines) + 3)
+        sections = self.help_sections()
+        # 1, 2 or 3 columns depending on width, so the whole list fits on big terminals
+        ncols = 3 if W >= 170 else 2 if W >= 112 else 1
+        bw = min(W - 2, {1: 80, 2: 124, 3: 186}[ncols])
+        gap = 2
+        colw = (bw - 4 - gap * (ncols - 1)) // ncols
+        kw = min(26, max(8, colw // 2 - 1))
+        # split sections in reading order into columns of about equal height
+        heights = [len(self.help_column([sec], kw)) + 1 for sec in sections]
+        target = sum(heights) / ncols
+        groups, run = [[]], 0
+        for sec, h in zip(sections, heights):
+            if groups[-1] and len(groups) < ncols and run + h / 2 > target * len(groups):
+                groups.append([])
+            groups[-1].append(sec)
+            run += h
+        cols = [self.help_column(g, kw) for g in groups]
+        nrows = max(len(c) for c in cols)
+        rows = [[c[i] if i < len(c) else ("blank",) for c in cols] for i in range(nrows)]
+        notes = ["Notes save automatically; unsaved edits to files survive restarts. "
+                 "Rebind keys under \"keys\" in the config.",
+                 "New notes: %s" % shorten_home(self.st.notes_dir),
+                 "Session: %s    Config: %s" % (shorten_home(self.st.base), shorten_home(CONFIG_PATH))]
+        footer = [("blank",)] + [("dim", line) for note in notes for line in wrap_words(note, bw - 4)]
+        rows += [[f] for f in footer]
+        bh = min(H - 2, len(rows) + 3)
         x0, y0 = (W - bw) // 2, (H - bh) // 2
         visible = bh - 3
-        self.help_scroll = max(0, min(self.help_scroll, len(lines) - visible))
+        self.help_scroll = max(0, min(self.help_scroll, len(rows) - visible))
         for r in range(bh):
             self.fill(y0 + r, x0, bw, A["box"])
-        more = len(lines) > visible
-        self.put(y0, x0 + 2, clip(" tuinotepad %s — %sany other key closes " % (
+        more = len(rows) > visible
+        self.put(y0, x0 + 2, clip(" tuinotepad %s — keys · %sany other key closes " % (
             VERSION, "↑/↓ scroll · " if more else ""), bw - 4), A["box_title"])
         if more:
-            pct = "%d%%" % (100 * (self.help_scroll + visible) // len(lines))
+            pct = "%d%%" % (100 * (self.help_scroll + visible) // len(rows))
             self.put(y0 + bh - 1, x0 + bw - len(pct) - 2, pct, A["box_dim"])
-        kw = min(30, bw // 2 - 2)
-        for i, (kind, a, b) in enumerate(lines[self.help_scroll:self.help_scroll + visible]):
-            y = y0 + 2 + i
+
+        def put_line(y, x, width, line):
+            kind = line[0]
             if kind == "title":
-                self.put(y, x0 + 2, a, A["box_title"])
+                self.put(y, x, clip(line[1], width), A["box_title"])
             elif kind == "row":
-                self.put(y, x0 + 4, clip(a, kw), A["box_key"])
-                self.put(y, x0 + 5 + kw, clip(b, bw - kw - 7), A["box"])
+                self.put(y, x + 2, clip(line[1], kw), A["box_key"])
+                self.put(y, x + 3 + kw, clip(line[2], max(1, width - kw - 3)), A["box"])
             elif kind == "dim":
-                self.put(y, x0 + 2, clip(a, bw - 4), A["box_dim"])
+                self.put(y, x, clip(line[1], bw - 4), A["box_dim"])
+
+        for i, row in enumerate(rows[self.help_scroll:self.help_scroll + visible]):
+            y = y0 + 2 + i
+            for c, line in enumerate(row):
+                put_line(y, x0 + 2 + c * (colw + gap), colw, line)
 
     # ---------------- find ----------------
 
@@ -2051,6 +2279,9 @@ class App:
         if kind == "mouse":
             return self.on_mouse(*ev[1:])
         self.follow = True
+        if self.mode == "notice":
+            self.mode, self.notice = None, None
+            return
         if self.mode == "help":
             step = {"up": -1, "down": 1, "pgup": -10, "pgdn": 10, "home": -999, "end": 999}.get(
                 ev[1] if kind == "key" else {"k": "up", "j": "down"}.get(ev[1] if kind == "char" else ""))
@@ -2374,8 +2605,6 @@ class App:
                 self.conflict = None
             elif d.sel() or d.mark:
                 d.anchor, d.mark = None, False
-            elif self.cfg.get("escape_hides_yakuake"):
-                toggle_yakuake()
             return
         sel = d.sel()
         if base == "backspace":
@@ -2411,9 +2640,9 @@ class App:
         K = curses
         wheel_up = b & K.BUTTON4_PRESSED
         wheel_down = b & getattr(K, "BUTTON5_PRESSED", 0x200000)
-        if self.mode == "help":
+        if self.mode in ("help", "notice"):
             if b & (K.BUTTON1_PRESSED | K.BUTTON1_CLICKED):
-                self.mode = None
+                self.mode, self.notice = None, None
             return
         if y == 0:
             if wheel_up or wheel_down:
@@ -2511,16 +2740,6 @@ def to256(h):
     return 232 + gray if gdist < cdist else 16 + 36 * ri + 6 * gi + bi
 
 
-def toggle_yakuake():
-    for exe in ("qdbus", "qdbus6", "qdbus-qt6", "qdbus-qt5"):
-        if shutil.which(exe):
-            try:
-                subprocess.Popen([exe, "org.kde.yakuake", "/yakuake/window", "toggleWindowState"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except OSError:
-                pass
-            return
-
 
 LOG_PATH = os.path.join(DEFAULT_DIR, "tuinotepad.log")
 
@@ -2538,7 +2757,7 @@ def log_exception():
 # Entry point
 # --------------------------------------------------------------------------
 
-def run_tui(storage, cfg, cfg_warning, files, stdin_text):
+def run_tui(storage, cfg, warnings, files, stdin_text):
     os.environ.setdefault("ESCDELAY", "25")
     cwd = os.getcwd()
     app = None
@@ -2564,7 +2783,7 @@ def run_tui(storage, cfg, cfg_warning, files, stdin_text):
         curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
         curses.mouseinterval(0)
         os.write(sys.stdout.fileno(), b"\x1b[?2004h\x1b[?1002h")   # bracketed paste, drag reporting
-        app = App(scr, storage, cfg, cfg_warning, files, stdin_text, cwd)
+        app = App(scr, storage, cfg, warnings, files, stdin_text, cwd)
         app.loop()
     finally:
         if app is not None:
@@ -2593,17 +2812,32 @@ def main(argv=None):
                                  "(modeled on DankMaterialShell's notepad).", epilog=HELP_EPILOG,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("files", nargs="*", help="files to open in tabs ('-' reads stdin into a new note)")
-    ap.add_argument("--dir", help="storage directory (default: %s)" % shorten_home(DEFAULT_DIR))
-    ap.add_argument("--dms", action="store_true", help="share DankMaterialShell's notepad storage (%s)" % shorten_home(DMS_DIR))
+    ap.add_argument("--dir", metavar="DIR", help="create new notes in DIR for this run (existing notes stay where they "
+                    "are; set \"notes_dir\" in the config to make it permanent)")
     ap.add_argument("--new", metavar="TEXT", help="add a note with TEXT ('-' = stdin) and exit; a running instance picks it up")
     ap.add_argument("--list", action="store_true", help="list tabs and exit")
     ap.add_argument("--version", action="version", version="%s %s" % (APP, VERSION))
     args = ap.parse_args(argv)
 
-    cfg, cfg_warning = load_config()
-    base = os.path.abspath(os.path.expanduser(args.dir or os.environ.get("TUINOTEPAD_DIR") or
-                                              (DMS_DIR if args.dms else DEFAULT_DIR)))
-    storage = Storage(base)
+    cfg, warnings = load_config()
+    base = DEFAULT_DIR
+    if args.dir:
+        notes_dir = os.path.abspath(os.path.expanduser(args.dir))
+    elif cfg["notes_dir"]:
+        notes_dir = os.path.normpath(os.path.join(os.path.expanduser("~"), os.path.expanduser(cfg["notes_dir"])))
+    else:
+        notes_dir = None
+    try:
+        storage = Storage(base, notes_dir)
+    except OSError as e:
+        if not notes_dir:
+            print("%s: cannot create %s: %s" % (APP, shorten_home(base), e.strerror), file=sys.stderr)
+            return 1
+        warnings.append("cannot use notes folder %s (%s); using the default" % (shorten_home(notes_dir), e.strerror))
+        storage = Storage(base)
+    if args.list or args.new is not None:
+        for w in warnings:
+            print("%s: config: %s" % (APP, w), file=sys.stderr)
 
     if args.list:
         res = storage.load_meta()
@@ -2621,7 +2855,7 @@ def main(argv=None):
         atomic_write(storage.full_path(tab), text)
         tabs.append(tab)
         storage.save_meta(tabs, idx)
-        print("Added note to %s" % shorten_home(storage.base))
+        print("Added note %s" % shorten_home(storage.full_path(tab)))
         return 0
 
     stdin_text = None
@@ -2640,7 +2874,7 @@ def main(argv=None):
         print("%s: stdout is not a terminal" % APP, file=sys.stderr)
         return 1
     try:
-        run_tui(storage, cfg, cfg_warning, files, stdin_text)
+        run_tui(storage, cfg, warnings, files, stdin_text)
     except Exception:
         log_exception()
         traceback.print_exc()
