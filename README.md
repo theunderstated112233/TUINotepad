@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/6f886a0e-253b-4b64-b668-4b7fd342b845
+
 # tuinotepad
 
 A persistent, tabbed notepad for the terminal, modeled on DankMaterialShell's
