@@ -1,0 +1,2653 @@
+#!/usr/bin/env python3
+"""tuinotepad - a persistent, tabbed notepad for the terminal.
+
+Modeled on DankMaterialShell's notepad (Meta+Shift+N): every tab is a note
+that saves itself, tabs survive restarts, and real files can be opened in
+tabs next to the notes. Single file, Python 3.8+ standard library only.
+
+Storage uses the same layout as DMS (notepad-session.json + notepad-files/),
+so `--dms` can share notes with a running DankMaterialShell.
+"""
+
+import argparse
+import curses
+import json
+import locale
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import traceback
+import unicodedata
+from bisect import bisect_right
+from datetime import datetime, timezone
+from functools import lru_cache
+
+VERSION = "0.1.0"
+APP = "tuinotepad"
+UNTITLED = "Untitled"
+
+
+def _xdg(var, default):
+    v = os.environ.get(var)
+    return v if v and os.path.isabs(v) else os.path.expanduser(default)
+
+
+STATE_HOME = _xdg("XDG_STATE_HOME", "~/.local/state")
+CONFIG_HOME = _xdg("XDG_CONFIG_HOME", "~/.config")
+CACHE_HOME = _xdg("XDG_CACHE_HOME", "~/.cache")
+DEFAULT_DIR = os.path.join(STATE_HOME, APP)
+DMS_DIR = os.path.join(STATE_HOME, "DankMaterialShell")
+DMS_COLORS = os.path.join(CACHE_HOME, "DankMaterialShell", "dms-colors.json")
+CONFIG_PATH = os.path.join(CONFIG_HOME, APP, "config.json")
+
+# --------------------------------------------------------------------------
+# Themes: DankMaterialShell's dark stock palettes (quickshell/Common/StockThemes.js)
+# --------------------------------------------------------------------------
+
+def _pal(primary, on_primary, primary_container, secondary, surface, text,
+         variant, variant_text, outline, container, container_high, container_highest):
+    return dict(primary=primary, on_primary=on_primary, primary_container=primary_container,
+                secondary=secondary, surface=surface, text=text, variant=variant,
+                variant_text=variant_text, outline=outline, container=container,
+                container_high=container_high, container_highest=container_highest)
+
+
+PALETTES = {
+    "purple": _pal("#d0bcff", "#381e72", "#4f378b", "#ccc2dc", "#141218", "#e6e0e9", "#49454e", "#cac4cf", "#948f99", "#211f24", "#2b292f", "#36343a"),
+    "blue": _pal("#42a5f5", "#000000", "#0d47a1", "#8ab4f8", "#101418", "#e0e2e8", "#42474e", "#c2c7cf", "#8c9199", "#1d2024", "#272a2f", "#32353a"),
+    "green": _pal("#4caf50", "#000000", "#1b5e20", "#81c995", "#10140f", "#e0e4db", "#424940", "#c2c9bd", "#8c9388", "#1d211b", "#272b25", "#323630"),
+    "orange": _pal("#ff6d00", "#000000", "#3e2723", "#ffb74d", "#1a120e", "#f0dfd8", "#52443d", "#d7c2b9", "#a08d85", "#271e1a", "#322824", "#3d332e"),
+    "red": _pal("#f44336", "#000000", "#4a0e0e", "#f28b82", "#1a1110", "#f1dedc", "#534341", "#d8c2be", "#a08c89", "#271d1c", "#322826", "#3d3231"),
+    "cyan": _pal("#00bcd4", "#000000", "#004d5c", "#4dd0e1", "#0e1416", "#dee3e5", "#3f484a", "#bfc8ca", "#899295", "#1b2122", "#252b2c", "#303637"),
+    "pink": _pal("#e91e63", "#000000", "#4a0e2f", "#f8bbd9", "#191112", "#f0dee0", "#524345", "#d6c2c3", "#9f8c8e", "#261d1e", "#312829", "#3c3233"),
+    "amber": _pal("#ffc107", "#000000", "#4a3c00", "#ffd54f", "#17130b", "#ebe1d4", "#4d4639", "#d0c5b4", "#998f80", "#231f17", "#2e2921", "#39342b"),
+    "coral": _pal("#ffb4ab", "#000000", "#8c1d18", "#f9dedc", "#1a1110", "#f1dedc", "#534341", "#d8c2bf", "#a08c8a", "#271d1c", "#322826", "#3d3231"),
+    "monochrome": _pal("#ffffff", "#2b303c", "#424753", "#c4c6d0", "#2a2a2a", "#e4e2e3", "#474648", "#c8c6c7", "#929092", "#353535", "#424242", "#505050"),
+}
+STATUS_COLORS = dict(error="#f2b8b5", error_container="#8c1d18", on_error_container="#f9dedc",
+                     warning="#ff9800", success="#4caf50")
+THEME_ORDER = list(PALETTES) + ["terminal", "dms"]
+
+# matugen (DMS wallpaper colors) key -> our palette key
+MATUGEN_KEYS = dict(primary="primary", on_primary="on_primary", primary_container="primary_container",
+                    secondary="secondary", surface="surface", text="on_surface", variant="surface_variant",
+                    variant_text="on_surface_variant", outline="outline", container="surface_container",
+                    container_high="surface_container_high", container_highest="surface_container_highest")
+
+
+def load_dms_palette():
+    """Wallpaper-derived colors DMS writes via matugen, if this machine runs DMS."""
+    try:
+        with open(DMS_COLORS, encoding="utf-8") as f:
+            data = json.load(f)
+        colors = data.get("colors", {})
+        scheme = colors.get("light" if data.get("mode") == "light" else "dark") or colors.get("dark")
+        pal = dict(PALETTES["purple"])
+        for ours, theirs in MATUGEN_KEYS.items():
+            v = scheme.get(theirs)
+            if isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+                pal[ours] = v
+        return pal
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "theme": "purple",            # a DMS stock theme, "dms" (wallpaper colors), or "terminal"
+    "transparent": True,          # keep the terminal's own background (like DMS's translucent slideout)
+    "line_numbers": False,
+    "auto_save_files": False,     # DMS "notepadAutoSave": also autosave opened files, not just notes
+    "autosave_delay": 2.0,        # seconds after the last keystroke (DMS uses 2s)
+    "tab_width": 4,
+    "auto_title": True,           # show an "Untitled" note's first line as its tab title
+    "confirm_close": True,        # ask before closing a note that has content
+    "escape_hides_yakuake": False,  # Esc with nothing to cancel toggles Yakuake (like Esc hiding DMS's notepad)
+    "keys": {},                   # {"action": ["ctrl+x", ...]} overrides, see --help-keys
+}
+
+ACTIONS = [
+    # (action, default keys, description)
+    ("new_tab", ["ctrl+n", "ctrl+t"], "New note"),
+    ("close_tab", ["ctrl+w"], "Close tab (notes go to trash)"),
+    ("reopen_tab", ["alt+u"], "Reopen last closed tab"),
+    ("next_tab", ["ctrl+pgdn", "alt+right"], "Next tab"),
+    ("prev_tab", ["ctrl+pgup", "alt+left"], "Previous tab"),
+    ("move_tab_right", ["ctrl+shift+pgdn", "alt+shift+right"], "Move tab right"),
+    ("move_tab_left", ["ctrl+shift+pgup", "alt+shift+left"], "Move tab left"),
+    ("rename_tab", ["f2", "ctrl+r"], "Rename tab"),
+    ("save", ["ctrl+s"], "Save (a note asks for a file path)"),
+    ("save_as", ["alt+s"], "Save as..."),
+    ("open", ["ctrl+o"], "Open file in a new tab"),
+    ("find", ["ctrl+f"], "Find"),
+    ("find_next", ["f3"], "Find next"),
+    ("find_prev", ["shift+f3"], "Find previous"),
+    ("undo", ["ctrl+z"], "Undo"),
+    ("redo", ["ctrl+y"], "Redo"),
+    ("select_all", ["ctrl+a"], "Select all"),
+    ("copy", ["ctrl+c"], "Copy"),
+    ("cut", ["ctrl+x"], "Cut"),
+    ("paste", ["ctrl+v"], "Paste"),
+    ("mark", ["ctrl+space"], "Start selection (then move with arrows)"),
+    ("delete_line", ["ctrl+k"], "Delete line"),
+    ("duplicate_line", ["ctrl+d"], "Duplicate line"),
+    ("move_line_up", ["alt+up"], "Move line up"),
+    ("move_line_down", ["alt+down"], "Move line down"),
+    ("toggle_line_numbers", ["alt+l"], "Toggle line numbers"),
+    ("toggle_autosave", ["alt+a"], "Toggle autosave for opened files"),
+    ("cycle_theme", ["alt+t"], "Next color theme"),
+    ("toggle_path", ["alt+i"], "Show file path"),
+    ("reload_disk", ["alt+r"], "Conflict: reload from disk"),
+    ("keep_mine", ["alt+k"], "Conflict: keep my edits"),
+    ("help", ["f1", "ctrl+g"], "Help"),
+    ("redraw", ["ctrl+l"], "Redraw screen"),
+    ("quit", ["ctrl+q"], "Quit (everything is kept)"),
+] + [("tab_%d" % n, ["alt+%d" % n], "Go to tab %d" % n if n < 9 else "Go to last tab") for n in range(1, 10)]
+
+ACTION_DESC = {a: d for a, _, d in ACTIONS}
+MOD_ORDER = ("ctrl", "alt", "shift")
+KEY_ALIASES = {"pagedown": "pgdn", "pageup": "pgup", "del": "delete", "return": "enter",
+               "escape": "esc", "ins": "insert", "bs": "backspace"}
+
+
+def normalize_keyname(name):
+    parts = [p for p in name.strip().lower().replace(" ", "").split("+") if p]
+    if not parts:
+        return ""
+    if parts[-1] == "" and len(parts) > 1:
+        parts[-1] = "+"
+    base = KEY_ALIASES.get(parts[-1], parts[-1])
+    mods = [m for m in MOD_ORDER if m in parts[:-1]]
+    return "+".join(mods + [base])
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    warning = None
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            for k, v in user.items():
+                if k in cfg:
+                    cfg[k] = v
+    except FileNotFoundError:
+        save_config(cfg)
+    except (OSError, ValueError) as e:
+        warning = "config.json ignored: %s" % e
+    return cfg, warning
+
+
+def save_config(cfg):
+    try:
+        atomic_write(CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def build_keymap(cfg):
+    actions = {a: list(keys) for a, keys, _ in ACTIONS}
+    overrides = cfg.get("keys") or {}
+    if isinstance(overrides, dict):
+        for act, keys in overrides.items():
+            if act in actions:
+                actions[act] = [keys] if isinstance(keys, str) else [k for k in keys if isinstance(k, str)]
+    keymap = {}
+    for act, keys in actions.items():
+        for k in keys:
+            n = normalize_keyname(k)
+            if n:
+                keymap[n] = act
+    return keymap, actions
+
+
+# --------------------------------------------------------------------------
+# File helpers
+# --------------------------------------------------------------------------
+
+def atomic_write(path, data):
+    path = os.path.realpath(path)
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
+    try:
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        except FileNotFoundError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+        text = f.read()
+    crlf = "\r\n" in text
+    if crlf:
+        text = text.replace("\r\n", "\n")
+    return text, crlf
+
+
+def file_sig(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return None
+
+
+def iso_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (int(time.time() * 1000) % 1000)
+
+
+_last_id = [0]
+
+
+def new_tab_id():
+    # DMS uses Date.now() (ms) as tab ids; keep them unique within a burst.
+    tid = max(int(time.time() * 1000), _last_id[0] + 1)
+    _last_id[0] = tid
+    return tid
+
+
+def expand_path(p, cwd):
+    p = os.path.expandvars(os.path.expanduser(p.strip()))
+    return os.path.normpath(p if os.path.isabs(p) else os.path.join(cwd, p))
+
+
+def shorten_home(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p == home or p.startswith(home + os.sep) else p
+
+
+# --------------------------------------------------------------------------
+# Storage (DMS-compatible notepad-session.json + notepad-files/)
+# --------------------------------------------------------------------------
+
+class Storage:
+    def __init__(self, base):
+        self.base = base
+        self.files_dir = os.path.join(base, "notepad-files")
+        self.meta_path = os.path.join(base, "notepad-session.json")
+        self.trash_dir = os.path.join(base, "notepad-trash")
+        self.recovery_dir = os.path.join(base, "notepad-recovery")
+        self.meta_sig = None
+        os.makedirs(self.files_dir, exist_ok=True)
+
+    def full_path(self, tab):
+        if tab.get("isTemporary"):
+            return os.path.join(self.base, tab.get("filePath", ""))
+        return tab.get("filePath", "")
+
+    def make_note_tab(self, title=UNTITLED):
+        tid = new_tab_id()
+        rel = "notepad-files/untitled-%d.txt" % tid
+        open(os.path.join(self.base, rel), "a").close()
+        return {"id": tid, "title": title, "filePath": rel, "isTemporary": True,
+                "lastModified": iso_now(), "cursorPosition": 0, "scrollPosition": 0}
+
+    @staticmethod
+    def make_file_tab(path):
+        return {"id": new_tab_id(), "title": os.path.basename(path) or path, "filePath": path,
+                "isTemporary": False, "lastModified": iso_now(), "cursorPosition": 0, "scrollPosition": 0}
+
+    def load_meta(self):
+        sig = file_sig(self.meta_path)
+        try:
+            with open(self.meta_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        self.meta_sig = sig
+        tabs = [t for t in data.get("tabs", []) if isinstance(t, dict) and "id" in t and "filePath" in t]
+        idx = data.get("currentTabIndex", 0)
+        return tabs, idx if isinstance(idx, int) else 0
+
+    def save_meta(self, tabs, idx):
+        data = {"version": 1, "currentTabIndex": idx, "tabs": tabs}
+        atomic_write(self.meta_path, json.dumps(data, indent=2))
+        self.meta_sig = file_sig(self.meta_path)
+
+    def meta_changed(self):
+        return file_sig(self.meta_path) != self.meta_sig
+
+    # Unsaved edits to opened files survive quitting/crashes here.
+    def _rec_path(self, tid):
+        return os.path.join(self.recovery_dir, "%s.json" % tid)
+
+    def save_recovery(self, tab, content, baseline):
+        atomic_write(self._rec_path(tab["id"]), json.dumps(
+            {"path": tab.get("filePath"), "content": content, "baseline": baseline}))
+
+    def load_recovery(self, tab):
+        try:
+            with open(self._rec_path(tab["id"]), encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("path") == tab.get("filePath"):
+                return data["content"], data["baseline"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    def clear_recovery(self, tid):
+        try:
+            os.unlink(self._rec_path(tid))
+        except OSError:
+            pass
+
+    def trash(self, path):
+        os.makedirs(self.trash_dir, exist_ok=True)
+        dest = os.path.join(self.trash_dir, os.path.basename(path))
+        shutil.move(path, dest)
+        return dest
+
+    def purge_trash(self, days=30):
+        cutoff = time.time() - days * 86400
+        try:
+            for name in os.listdir(self.trash_dir):
+                p = os.path.join(self.trash_dir, name)
+                if os.path.getmtime(p) < cutoff:
+                    os.unlink(p)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Text measurement
+# --------------------------------------------------------------------------
+
+@lru_cache(maxsize=4096)
+def char_width(ch):
+    o = ord(ch)
+    if o < 32 or o == 127:
+        return 2                      # shown as ^X
+    if 0xD800 <= o <= 0xDFFF:
+        return 1                      # undecodable byte, shown as U+FFFD
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def text_width(s):
+    return sum(char_width(c) for c in s)
+
+
+def clip(s, maxw, ellipsis="…"):
+    if text_width(s) <= maxw:
+        return s
+    out, w = [], 0
+    for c in s:
+        cw = char_width(c)
+        if w + cw > maxw - 1:
+            break
+        out.append(c)
+        w += cw
+    return "".join(out) + ellipsis
+
+
+def is_word(ch):
+    return ch.isalnum() or ch == "_"
+
+
+# --------------------------------------------------------------------------
+# Document: text buffer with undo
+# --------------------------------------------------------------------------
+
+def end_of(a, text):
+    parts = text.split("\n")
+    if len(parts) == 1:
+        return (a[0], a[1] + len(text))
+    return (a[0] + len(parts) - 1, len(parts[-1]))
+
+
+class Doc:
+    def __init__(self, text, baseline, crlf=False):
+        self.lines = text.split("\n")
+        self.baseline = baseline
+        self.crlf = crlf
+        self.cur = (0, 0)
+        self.anchor = None
+        self.mark = False
+        self.want_x = None
+        self.top = (0, 0)
+        self.undo = []
+        self.redo = []
+        self.merge_ok = False
+        self.version = 0
+        self._text = (0, text)
+        self.disk_sig = None
+        self.last_edit = None          # monotonic time of the last unsaved edit (autosave timer)
+        self._group = None
+
+    def text(self):
+        if self._text[0] != self.version:
+            self._text = (self.version, "\n".join(self.lines))
+        return self._text[1]
+
+    def modified(self):
+        return self.text() != self.baseline
+
+    def end(self):
+        return (len(self.lines) - 1, len(self.lines[-1]))
+
+    def clamp(self, p):
+        r = max(0, min(p[0], len(self.lines) - 1))
+        return (r, max(0, min(p[1], len(self.lines[r]))))
+
+    def sel(self):
+        if self.anchor is None or self.anchor == self.cur:
+            return None
+        return (min(self.anchor, self.cur), max(self.anchor, self.cur))
+
+    def get(self, a, b):
+        (r1, c1), (r2, c2) = a, b
+        if r1 == r2:
+            return self.lines[r1][c1:c2]
+        return "\n".join([self.lines[r1][c1:]] + self.lines[r1 + 1:r2] + [self.lines[r2][:c2]])
+
+    def _raw(self, a, b, text):
+        (r1, c1), (r2, c2) = a, b
+        new = (self.lines[r1][:c1] + text + self.lines[r2][c2:]).split("\n")
+        self.lines[r1:r2 + 1] = new
+        self.version += 1
+        self.last_edit = time.monotonic()
+        return end_of(a, text)
+
+    def begin_group(self):
+        self._group = object()
+
+    def end_group(self):
+        self._group = None
+
+    def replace(self, a, b, text, kind=None):
+        """The one primitive every edit goes through; records undo."""
+        if a > b:
+            a, b = b, a
+        removed = self.get(a, b)
+        if not removed and not text:
+            return a
+        before = self.cur
+        end = self._raw(a, b, text)
+        rec = self.undo[-1] if self.undo else None
+        merged = False
+        if kind and self.merge_ok and rec and rec["kind"] == kind and rec["g"] is None and self._group is None:
+            if kind == "type" and not removed and a == rec["after"] and "\n" not in text \
+                    and not (text.isspace() and rec["ins"] and not rec["ins"][-1].isspace()):
+                rec["ins"] += text
+                rec["after"] = end
+                merged = True
+            elif kind == "bs" and not text and b == rec["a"]:
+                rec["rem"] = removed + rec["rem"]
+                rec["a"] = a
+                rec["after"] = a
+                merged = True
+            elif kind == "del" and not text and a == rec["a"]:
+                rec["rem"] += removed
+                merged = True
+        if not merged:
+            self.undo.append({"a": a, "rem": removed, "ins": text, "before": before,
+                              "after": end, "kind": kind, "g": self._group})
+            if len(self.undo) > 5000:
+                del self.undo[:1000]
+        self.redo.clear()
+        self.cur = end
+        self.anchor = None
+        self.mark = False
+        self.want_x = None
+        self.merge_ok = kind is not None
+        return end
+
+    def do_undo(self):
+        if not self.undo:
+            return False
+        g = self.undo[-1]["g"]
+        while self.undo:
+            rec = self.undo.pop()
+            self._raw(rec["a"], end_of(rec["a"], rec["ins"]), rec["rem"])
+            self.redo.append(rec)
+            self.cur = self.clamp(rec["before"])
+            if g is None or not self.undo or self.undo[-1]["g"] is not g:
+                break
+        self.anchor, self.mark, self.merge_ok, self.want_x = None, False, False, None
+        return True
+
+    def do_redo(self):
+        if not self.redo:
+            return False
+        g = self.redo[-1]["g"]
+        while self.redo:
+            rec = self.redo.pop()
+            self._raw(rec["a"], end_of(rec["a"], rec["rem"]), rec["ins"])
+            self.undo.append(rec)
+            self.cur = self.clamp(rec["after"])
+            if g is None or not self.redo or self.redo[-1]["g"] is not g:
+                break
+        self.anchor, self.mark, self.merge_ok, self.want_x = None, False, False, None
+        return True
+
+    def set_text_undoable(self, text):
+        """Replace everything (e.g. reload from disk) but keep it undoable."""
+        cur, top = self.cur, self.top
+        self.replace((0, 0), self.end(), text)
+        self.cur = self.clamp(cur)
+        self.top = (min(top[0], len(self.lines) - 1), 0)
+
+    def offset(self, p=None):
+        r, c = p or self.cur
+        return sum(len(l) + 1 for l in self.lines[:r]) + c
+
+    def pos_at(self, off):
+        for r, line in enumerate(self.lines):
+            if off <= len(line):
+                return (r, off)
+            off -= len(line) + 1
+        return self.end()
+
+
+# --------------------------------------------------------------------------
+# Clipboard
+# --------------------------------------------------------------------------
+
+class Clipboard:
+    def __init__(self):
+        self.internal = ""
+
+    @staticmethod
+    def _tools():
+        tools = []
+        if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+            tools.append((["wl-copy"], ["wl-paste", "-n"]))
+        if os.environ.get("DISPLAY"):
+            if shutil.which("xclip"):
+                tools.append((["xclip", "-selection", "clipboard", "-i"], ["xclip", "-selection", "clipboard", "-o"]))
+            if shutil.which("xsel"):
+                tools.append((["xsel", "-b", "-i"], ["xsel", "-b", "-o"]))
+        if shutil.which("pbcopy"):
+            tools.append((["pbcopy"], ["pbpaste"]))
+        return tools
+
+    def copy(self, text):
+        self.internal = text
+        for cp, _ in self._tools():
+            try:
+                subprocess.run(cp, input=text.encode("utf-8", "surrogateescape"), stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=2, check=True)
+                return "clipboard"
+            except (OSError, subprocess.SubprocessError):
+                continue
+        # OSC 52: lets the terminal itself set the clipboard (works over SSH too)
+        import base64
+        try:
+            data = base64.b64encode(text.encode("utf-8", "surrogateescape")).decode()
+            os.write(sys.stdout.fileno(), ("\x1b]52;c;%s\x07" % data).encode())
+            return "terminal clipboard"
+        except OSError:
+            return "internal clipboard"
+
+    def paste(self):
+        for _, ps in self._tools():
+            try:
+                out = subprocess.run(ps, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2, check=True).stdout
+                return out.decode("utf-8", "surrogateescape").replace("\r\n", "\n")
+            except (OSError, subprocess.SubprocessError):
+                continue
+        return self.internal
+
+
+# --------------------------------------------------------------------------
+# Input decoding: curses keys -> canonical names like "ctrl+shift+pgdn"
+# --------------------------------------------------------------------------
+
+def _mods_from_xterm(m):
+    m = max(0, m - 1)
+    mods = []
+    if m & 4:
+        mods.append("ctrl")
+    if m & 2:
+        mods.append("alt")
+    if m & 1:
+        mods.append("shift")
+    return mods
+
+
+def with_mods(mods, base):
+    s = set(mods)
+    return "+".join([m for m in MOD_ORDER if m in s] + [base])
+
+
+CSI_FINAL = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end",
+             "P": "f1", "Q": "f2", "R": "f3", "S": "f4"}
+CSI_TILDE = {1: "home", 2: "insert", 3: "delete", 4: "end", 5: "pgup", 6: "pgdn", 7: "home", 8: "end",
+             11: "f1", 12: "f2", 13: "f3", 14: "f4", 15: "f5", 17: "f6", 18: "f7", 19: "f8", 20: "f9",
+             21: "f10", 23: "f11", 24: "f12"}
+TERMINFO_BASE = {"LFT": "left", "RIT": "right", "UP": "up", "DN": "down", "NXT": "pgdn", "PRV": "pgup",
+                 "HOM": "home", "END": "end", "DC": "delete", "IC": "insert"}
+
+
+def parse_csi(seq):
+    m = re.fullmatch(r"[\[O](\d*)(?:;(\d+))?([A-DFHPQRS~])", seq)
+    if not m:
+        return None
+    num, mod, final = m.group(1), m.group(2), m.group(3)
+    if final == "~":
+        base = CSI_TILDE.get(int(num or 0))
+    else:
+        base = CSI_FINAL.get(final)
+    if not base:
+        return None
+    return with_mods(_mods_from_xterm(int(mod)) if mod else [], base)
+
+
+class Input:
+    def __init__(self, scr):
+        self.scr = scr
+        self.pending = []
+        k = curses
+        self.intmap = {
+            k.KEY_UP: "up", k.KEY_DOWN: "down", k.KEY_LEFT: "left", k.KEY_RIGHT: "right",
+            k.KEY_HOME: "home", k.KEY_END: "end", k.KEY_PPAGE: "pgup", k.KEY_NPAGE: "pgdn",
+            k.KEY_DC: "delete", k.KEY_IC: "insert", k.KEY_BACKSPACE: "backspace", k.KEY_ENTER: "enter",
+            k.KEY_BTAB: "shift+tab", k.KEY_SLEFT: "shift+left", k.KEY_SRIGHT: "shift+right",
+            k.KEY_SR: "shift+up", k.KEY_SF: "shift+down", k.KEY_SHOME: "shift+home", k.KEY_SEND: "shift+end",
+            k.KEY_SPREVIOUS: "shift+pgup", k.KEY_SNEXT: "shift+pgdn", k.KEY_SDC: "shift+delete",
+            getattr(k, "KEY_B2", -99): "", getattr(k, "KEY_A1", -98): "home", getattr(k, "KEY_C1", -97): "end",
+            getattr(k, "KEY_A3", -96): "pgup", getattr(k, "KEY_C3", -95): "pgdn",
+        }
+        for n in range(1, 61):
+            base = "f%d" % ((n - 1) % 12 + 1)
+            mods = [[], ["shift"], ["ctrl"], ["ctrl", "shift"], ["alt"]][(n - 1) // 12]
+            self.intmap[curses.KEY_F0 + n] = with_mods(mods, base)
+
+    def _get(self, timeout):
+        if self.pending:
+            return self.pending.pop(0)
+        self.scr.timeout(timeout)
+        try:
+            return self.scr.get_wch()
+        except curses.error:
+            return None
+        except KeyboardInterrupt:
+            return "\x03"
+
+    def read(self, timeout):
+        events = []
+        ch = self._get(timeout)
+        while ch is not None:
+            ev = self._decode(ch)
+            if ev:
+                events.append(ev)
+            if len(events) >= 4000:
+                break
+            ch = self._get(0)
+        return events
+
+    def _intname(self, code):
+        if code in self.intmap:
+            return self.intmap[code]
+        try:
+            kn = curses.keyname(code).decode()
+        except (ValueError, curses.error):
+            return None
+        m = re.fullmatch(r"k(LFT|RIT|UP|DN|NXT|PRV|HOM|END|DC|IC)(\d)", kn)
+        if m:
+            return with_mods(_mods_from_xterm(int(m.group(2))), TERMINFO_BASE[m.group(1)])
+        return None
+
+    @staticmethod
+    def _charname(ch):
+        o = ord(ch)
+        if o == 0:
+            return "ctrl+space"
+        if o in (10, 13):
+            return "enter"
+        if o == 9:
+            return "tab"
+        if o in (8, 127):
+            return "backspace"
+        if 1 <= o <= 26:
+            return "ctrl+" + chr(o + 96)
+        if 28 <= o <= 31:
+            return "ctrl+" + "\\]^_"[o - 28]
+        return None
+
+    def _decode(self, ch):
+        if isinstance(ch, int):
+            if ch == curses.KEY_RESIZE:
+                return ("resize",)
+            if ch == curses.KEY_MOUSE:
+                try:
+                    _, x, y, _, b = curses.getmouse()
+                    return ("mouse", x, y, b)
+                except curses.error:
+                    return None
+            name = self._intname(ch)
+            return ("key", name) if name else None
+        if ch == "\x1b":
+            return self._escape()
+        name = self._charname(ch)
+        if name:
+            return ("key", name)
+        return ("char", ch)
+
+    def _escape(self):
+        ch = self._get(30)
+        if ch is None:
+            return ("key", "esc")
+        if isinstance(ch, int):
+            name = self._intname(ch)
+            return ("key", with_mods(["alt"] + name.split("+")[:-1], name.split("+")[-1])) if name else None
+        if ch == "\x1b":
+            inner = self._escape()
+            if inner and inner[0] == "key" and inner[1] != "esc":
+                parts = inner[1].split("+")
+                return ("key", with_mods(["alt"] + parts[:-1], parts[-1]))
+            return ("key", "esc")
+        if ch in "[O":
+            seq = ch
+            while True:
+                c = self._get(30)
+                if c is None:
+                    break
+                if isinstance(c, int):
+                    self.pending.append(c)
+                    break
+                seq += c
+                if "\x40" <= c <= "\x7e" or len(seq) > 32:
+                    break
+            if seq in ("[", "O"):
+                return ("key", "alt+shift+o" if seq == "O" else "alt+[")
+            if seq == "[200~":
+                return ("paste", self._read_paste())
+            name = parse_csi(seq)
+            return ("key", name) if name else None
+        name = self._charname(ch)
+        if name:
+            parts = name.split("+")
+            return ("key", with_mods(["alt"] + parts[:-1], parts[-1]))
+        if ch.isalpha() and ch.isupper():
+            return ("key", "alt+shift+" + ch.lower())
+        return ("key", "alt+" + ch)
+
+    def _read_paste(self):
+        buf = []
+        end = "\x1b[201~"
+        while True:
+            c = self._get(200)
+            if c is None:
+                break
+            if isinstance(c, int):
+                name = self._intname(c)
+                if name == "enter":
+                    buf.append("\n")
+                continue
+            buf.append(c)
+            if c == "~" and "".join(buf[-6:]) == end:
+                del buf[-6:]
+                break
+        return "".join(buf).replace("\r\n", "\n").replace("\r", "\n")
+
+
+class LineInput:
+    """Single-line text field used by prompts and the find bar."""
+
+    def __init__(self, text=""):
+        self.text = text
+        self.pos = len(text)
+
+    def handle(self, ev):
+        kind = ev[0]
+        if kind == "char":
+            self.text = self.text[:self.pos] + ev[1] + self.text[self.pos:]
+            self.pos += len(ev[1])
+            return "edit"
+        if kind == "paste":
+            t = ev[1].replace("\n", " ")
+            self.text = self.text[:self.pos] + t + self.text[self.pos:]
+            self.pos += len(t)
+            return "edit"
+        if kind != "key":
+            return None
+        k = ev[1]
+        if k == "enter":
+            return "enter"
+        if k == "esc":
+            return "cancel"
+        if k == "backspace" and self.pos > 0:
+            self.text = self.text[:self.pos - 1] + self.text[self.pos:]
+            self.pos -= 1
+            return "edit"
+        if k in ("alt+backspace", "ctrl+w"):
+            i = self.pos
+            while i > 0 and not is_word(self.text[i - 1]):
+                i -= 1
+            while i > 0 and is_word(self.text[i - 1]):
+                i -= 1
+            self.text = self.text[:i] + self.text[self.pos:]
+            self.pos = i
+            return "edit"
+        if k == "delete" and self.pos < len(self.text):
+            self.text = self.text[:self.pos] + self.text[self.pos + 1:]
+            return "edit"
+        if k == "ctrl+u":
+            self.text, self.pos = "", 0
+            return "edit"
+        if k == "left":
+            self.pos = max(0, self.pos - 1)
+        elif k == "right":
+            self.pos = min(len(self.text), self.pos + 1)
+        elif k in ("home", "ctrl+a"):
+            self.pos = 0
+        elif k in ("end", "ctrl+e"):
+            self.pos = len(self.text)
+        else:
+            return None
+        return "move"
+
+
+# --------------------------------------------------------------------------
+# The application
+# --------------------------------------------------------------------------
+
+def pretty_key(k):
+    names = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "pgdn": "PgDn", "pgup": "PgUp", "left": "←",
+             "right": "→", "up": "↑", "down": "↓", "space": "Space", "esc": "Esc", "enter": "Enter",
+             "tab": "Tab", "backspace": "Backspace", "delete": "Del", "home": "Home", "end": "End"}
+    return "+".join(names.get(p, p.upper()) for p in k.split("+"))
+
+
+class App:
+    def __init__(self, scr, storage, cfg, cfg_warning, open_files, stdin_text, cwd):
+        self.scr = scr
+        self.st = storage
+        self.cfg = cfg
+        self.cwd = cwd
+        self.keymap, self.action_keys = build_keymap(cfg)
+        self.input = Input(scr)
+        self.clip = Clipboard()
+        self.tabs = []
+        self.cur = 0
+        self.docs = {}
+        self.closed = []           # stack for "reopen closed tab"
+        self.title_cache = {}
+        self.wrap_cache = {}
+        self.mode = None           # None | "prompt" | "confirm" | "find" | "help"
+        self.prompt = None
+        self.confirm = None
+        self.find = None           # {"input": LineInput, "origin": pos}
+        self.matches = []
+        self.match_lines = {}
+        self.match_key = None
+        self.conflict = None       # (tab id, disk text)
+        self.msg = None            # (text, level, expires)
+        self.show_path = False
+        self.help_scroll = 0
+        self.follow = True
+        self.quit = False
+        self.stop_signal = False
+        self.last_poll = 0.0
+        self.tab_first = 0
+        self.regions = []
+        self.cursor_screen = None
+        self.last_click = (0.0, None, 0)
+        self.dragging = False
+        self.edit_y0 = 1
+        self.edit_h = 1
+        self.text_w = 1
+        self.gutter = 0
+        self.shut_down = False
+        self.setup_colors()
+        self.load_session()
+        for path in open_files:
+            self.open_path(path, quiet=True)
+        if stdin_text is not None:
+            tab = self.st.make_note_tab()
+            atomic_write(self.st.full_path(tab), stdin_text)
+            self.tabs.append(tab)
+            self.cur = len(self.tabs) - 1
+            self.save_meta()
+        if cfg_warning:
+            self.message(cfg_warning, "error")
+        self.st.purge_trash()
+        self.set_terminal_title()
+
+    # ---------------- colors ----------------
+
+    def setup_colors(self):
+        self.attr = {}
+        name = self.cfg.get("theme", "purple")
+        has_color = curses.has_colors()
+        colors = curses.COLORS if has_color else 0
+        pal = None
+        if name == "dms":
+            pal = load_dms_palette()
+            if pal is None:
+                self.message("No DMS colors found (%s); using purple" % shorten_home(DMS_COLORS), "warn")
+        elif name in PALETTES:
+            pal = PALETTES[name]
+        elif name != "terminal":
+            pal = PALETTES["purple"]
+        roles = {}
+        if pal and colors >= 256:
+            def c(h):
+                return to256(h)
+            bg = -1 if self.cfg.get("transparent", True) else c(pal["surface"])
+            s = STATUS_COLORS
+            roles = {
+                "text": (c(pal["text"]), bg, 0),
+                "dim": (c(pal["outline"]), bg, 0),
+                "sel": (c(pal["text"]), c(pal["primary_container"]), 0),
+                "match": (c(pal["surface"]), c(pal["secondary"]), 0),
+                "bar": (c(pal["variant_text"]), c(pal["container"]), 0),
+                "bar_dim": (c(pal["outline"]), c(pal["container"]), 0),
+                "bar_primary": (c(pal["primary"]), c(pal["container"]), curses.A_BOLD),
+                "tab": (c(pal["variant_text"]), c(pal["container_high"]), 0),
+                "tab_active": (c(pal["on_primary"]), c(pal["primary"]), curses.A_BOLD),
+                "ok": (c(s["success"]), c(pal["container"]), 0),
+                "warn": (c(s["warning"]), c(pal["container"]), 0),
+                "error": (c(s["error"]), c(pal["container"]), curses.A_BOLD),
+                "banner": (c(s["on_error_container"]), c(s["error_container"]), 0),
+                "box": (c(pal["text"]), c(pal["container_high"]), 0),
+                "box_title": (c(pal["primary"]), c(pal["container_high"]), curses.A_BOLD),
+                "box_key": (c(pal["primary"]), c(pal["container_high"]), 0),
+                "box_dim": (c(pal["outline"]), c(pal["container_high"]), 0),
+            }
+        elif colors >= 8:
+            K = curses
+            roles = {
+                "text": (-1, -1, 0), "dim": (-1, -1, K.A_DIM), "sel": (-1, -1, K.A_REVERSE),
+                "match": (K.COLOR_BLACK, K.COLOR_YELLOW, 0), "bar": (-1, -1, K.A_REVERSE),
+                "bar_dim": (-1, -1, K.A_REVERSE), "bar_primary": (K.COLOR_MAGENTA, -1, K.A_REVERSE | K.A_BOLD),
+                "tab": (-1, -1, K.A_REVERSE), "tab_active": (K.COLOR_MAGENTA, -1, K.A_REVERSE | K.A_BOLD),
+                "ok": (K.COLOR_GREEN, -1, K.A_REVERSE), "warn": (K.COLOR_YELLOW, -1, K.A_REVERSE),
+                "error": (K.COLOR_RED, -1, K.A_REVERSE | K.A_BOLD), "banner": (K.COLOR_WHITE, K.COLOR_RED, K.A_BOLD),
+                "box": (-1, -1, K.A_REVERSE), "box_title": (K.COLOR_MAGENTA, -1, K.A_REVERSE | K.A_BOLD),
+                "box_key": (K.COLOR_MAGENTA, -1, K.A_REVERSE), "box_dim": (-1, -1, K.A_REVERSE | K.A_DIM),
+            }
+        n = 1
+        for role, (fg, bg, extra) in roles.items():
+            try:
+                curses.init_pair(n, fg, bg)
+                self.attr[role] = curses.color_pair(n) | extra
+            except curses.error:
+                self.attr[role] = extra
+            n += 1
+        mono = {"sel": curses.A_REVERSE, "match": curses.A_UNDERLINE | curses.A_BOLD, "bar": curses.A_REVERSE,
+                "bar_dim": curses.A_REVERSE, "bar_primary": curses.A_REVERSE | curses.A_BOLD, "tab": curses.A_REVERSE,
+                "tab_active": curses.A_BOLD, "ok": curses.A_REVERSE, "warn": curses.A_REVERSE,
+                "error": curses.A_REVERSE | curses.A_BOLD, "banner": curses.A_REVERSE | curses.A_BOLD,
+                "box": curses.A_REVERSE, "box_title": curses.A_REVERSE | curses.A_BOLD,
+                "box_key": curses.A_REVERSE | curses.A_BOLD, "box_dim": curses.A_REVERSE, "dim": curses.A_DIM, "text": 0}
+        for role, a in mono.items():
+            self.attr.setdefault(role, a)
+        try:
+            self.scr.bkgd(" ", self.attr["text"])
+        except curses.error:
+            pass
+
+    # ---------------- session / tabs ----------------
+
+    def load_session(self):
+        res = self.st.load_meta()
+        if res:
+            self.tabs, idx = res
+            self.cur = max(0, min(idx, len(self.tabs) - 1))
+        if not self.tabs:
+            self.tabs = [self.st.make_note_tab()]
+            self.cur = 0
+            self.save_meta()
+
+    def save_meta(self):
+        try:
+            self.st.save_meta(self.tabs, self.cur)
+        except OSError as e:
+            self.message("Could not save session: %s" % e, "error")
+
+    def sync_meta(self):
+        """Pick up tab changes made by another instance (or by DMS with --dms)."""
+        if not self.st.meta_changed():
+            return
+        res = self.st.load_meta()
+        if not res:
+            return
+        tabs, idx = res
+        cur_id = self.tabs[self.cur]["id"] if self.tabs else None
+        ids = {t["id"] for t in tabs}
+        for tid in list(self.docs):
+            if tid not in ids:
+                del self.docs[tid]
+        self.tabs = tabs or [self.st.make_note_tab()]
+        pos = next((i for i, t in enumerate(self.tabs) if t["id"] == cur_id), None)
+        self.cur = pos if pos is not None else max(0, min(idx, len(self.tabs) - 1))
+        if not tabs:
+            self.save_meta()
+
+    @property
+    def tab(self):
+        return self.tabs[self.cur]
+
+    @property
+    def doc(self):
+        return self.doc_for(self.tab)
+
+    def doc_for(self, tab):
+        d = self.docs.get(tab["id"])
+        if d is not None:
+            return d
+        path = self.st.full_path(tab)
+        text, crlf, sig = "", False, None
+        try:
+            text, crlf = read_text(path)
+            sig = file_sig(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self.message("Cannot read %s: %s" % (shorten_home(path), e.strerror), "error")
+        d = Doc(text, text, crlf)
+        d.disk_sig = sig
+        if not tab.get("isTemporary"):
+            rec = self.st.load_recovery(tab)
+            if rec:
+                content, base = rec
+                if content != text:
+                    d.lines = content.split("\n")
+                    d.version += 1
+                    d.baseline = text
+                    if base != text:
+                        self.conflict = (tab["id"], text)
+                    self.message("Restored unsaved changes", "warn")
+        d.cur = d.clamp(d.pos_at(tab.get("cursorPosition") or 0))
+        d.top = (min(max(0, int(tab.get("scrollPosition") or 0)), len(d.lines) - 1), 0) \
+            if isinstance(tab.get("scrollPosition"), (int, float)) else (0, 0)
+        d.last_edit = None
+        self.docs[tab["id"]] = d
+        return d
+
+    def remember_cursor(self, tab):
+        d = self.docs.get(tab["id"])
+        if d:
+            tab["cursorPosition"] = d.offset()
+            tab["scrollPosition"] = d.top[0]
+
+    def flush(self, tab):
+        """Save a tab the way DMS does on hide/switch: notes always, files if autosave is on."""
+        d = self.docs.get(tab["id"])
+        if not d:
+            return
+        d.last_edit = None
+        if not d.modified():
+            return
+        if tab.get("isTemporary"):
+            self.save_note(tab, d)
+        elif self.cfg.get("auto_save_files"):
+            self.save_file(tab, d, auto=True)
+
+    def switch(self, i):
+        if not self.tabs:
+            return
+        i = max(0, min(i, len(self.tabs) - 1))
+        if i == self.cur:
+            return
+        self.flush(self.tab)
+        self.remember_cursor(self.tab)
+        self.close_find()
+        self.cur = i
+        self.check_disk(self.tab)
+        self.save_meta()
+        self.follow = True
+        self.set_terminal_title()
+
+    def new_tab(self):
+        self.sync_meta()
+        self.flush(self.tab)
+        self.remember_cursor(self.tab)
+        try:
+            tab = self.st.make_note_tab()
+        except OSError as e:
+            return self.message("Cannot create note: %s" % e, "error")
+        self.tabs.append(tab)
+        self.cur = len(self.tabs) - 1
+        self.close_find()
+        self.save_meta()
+        self.set_terminal_title()
+
+    def close_tab(self, i=None, confirmed=False):
+        i = self.cur if i is None else i
+        tab = self.tabs[i]
+        d = self.docs.get(tab["id"])
+        title = self.display_title(tab)
+        if not confirmed:
+            if tab.get("isTemporary"):
+                has_content = (d.text() != "") if d else (os.path.getsize(self.st.full_path(tab)) > 0
+                                                          if os.path.exists(self.st.full_path(tab)) else False)
+                if has_content and self.cfg.get("confirm_close", True):
+                    return self.ask("Close “%s”? It moves to the trash (Alt+U reopens). [y/N]" % title,
+                                    {"y": lambda: self.close_tab(i, True)})
+            elif d and d.modified():
+                def save_then_close():
+                    if self.save_file(tab, d):
+                        self.close_tab(i, True)
+                return self.ask("Save changes to “%s”? [y]es [n]o [c]ancel" % title,
+                                {"y": save_then_close, "n": lambda: self.close_tab(i, True)})
+        self.sync_meta()
+        i = next((k for k, t in enumerate(self.tabs) if t["id"] == tab["id"]), None)
+        if i is None:
+            return
+        self.remember_cursor(tab)
+        entry = {"tab": dict(tab), "index": i, "trash": None}
+        if tab.get("isTemporary"):
+            path = self.st.full_path(tab)
+            if d:
+                self.save_note(tab, d, meta=False)
+            try:
+                if os.path.exists(path):
+                    if os.path.getsize(path) > 0:
+                        entry["trash"] = self.st.trash(path)
+                    else:
+                        os.unlink(path)
+            except OSError as e:
+                self.message("Could not move note to trash: %s" % e, "error")
+        if entry["trash"] or not tab.get("isTemporary"):
+            self.closed.append(entry)
+        self.docs.pop(tab["id"], None)
+        self.st.clear_recovery(tab["id"])
+        if self.conflict and self.conflict[0] == tab["id"]:
+            self.conflict = None
+        self.close_find()
+        if len(self.tabs) <= 1:
+            self.tabs = [self.st.make_note_tab()]
+            self.cur = 0
+        else:
+            self.tabs.pop(i)
+            if self.cur >= len(self.tabs):
+                self.cur = len(self.tabs) - 1
+            elif self.cur > i:
+                self.cur -= 1
+        self.save_meta()
+        self.message("Closed “%s”" % title)
+        self.set_terminal_title()
+
+    def reopen_tab(self):
+        if not self.closed:
+            return self.message("Nothing to reopen")
+        entry = self.closed.pop()
+        tab = entry["tab"]
+        if entry["trash"]:
+            try:
+                shutil.move(entry["trash"], self.st.full_path(tab))
+            except OSError as e:
+                return self.message("Could not restore: %s" % e, "error")
+        self.sync_meta()
+        self.flush(self.tab)
+        self.remember_cursor(self.tab)
+        idx = min(entry["index"], len(self.tabs))
+        self.tabs.insert(idx, tab)
+        self.cur = idx
+        self.save_meta()
+        self.message("Reopened “%s”" % self.display_title(tab), "ok")
+
+    def move_tab(self, delta):
+        j = self.cur + delta
+        if 0 <= j < len(self.tabs):
+            self.sync_meta()
+            self.tabs[self.cur], self.tabs[j] = self.tabs[j], self.tabs[self.cur]
+            self.cur = j
+            self.save_meta()
+
+    def rename_tab(self):
+        tab = self.tab
+        cur_title = tab.get("title") or UNTITLED
+
+        def done(text):
+            name = text.strip()
+            if not name or name == tab.get("title"):
+                return
+            if tab.get("isTemporary"):
+                tab["title"] = name
+            else:
+                old = tab["filePath"]
+                new = os.path.join(os.path.dirname(old), name)
+                if os.path.exists(new):
+                    return self.message("“%s” already exists" % shorten_home(new), "error")
+                try:
+                    if os.path.exists(old):
+                        os.rename(old, new)
+                except OSError as e:
+                    return self.message("Rename failed: %s" % e.strerror, "error")
+                self.st.clear_recovery(tab["id"])
+                tab["filePath"] = new
+                tab["title"] = name
+                d = self.docs.get(tab["id"])
+                if d:
+                    d.disk_sig = file_sig(new)
+            tab["lastModified"] = iso_now()
+            self.title_cache.pop(tab["id"], None)
+            self.save_meta()
+            self.set_terminal_title()
+        self.ask_text("Rename:", cur_title, done)
+
+    # ---------------- saving ----------------
+
+    def _disk_text(self, d):
+        t = d.text()
+        return t.replace("\n", "\r\n") if d.crlf else t
+
+    def save_note(self, tab, d, meta=True):
+        try:
+            atomic_write(self.st.full_path(tab), self._disk_text(d))
+        except OSError as e:
+            self.message("Autosave failed: %s" % e, "error")
+            return False
+        d.baseline = d.text()
+        d.disk_sig = file_sig(self.st.full_path(tab))
+        d.last_edit = None
+        tab["lastModified"] = iso_now()
+        if meta:
+            self.save_meta()
+        return True
+
+    def save_file(self, tab, d, auto=False, force=False):
+        """Save an opened file, refusing to clobber changes made on disk (DMS freshness check)."""
+        path = tab["filePath"]
+        if not force and os.path.exists(path) and file_sig(path) != d.disk_sig:
+            try:
+                disk, _ = read_text(path)
+            except OSError:
+                disk = None
+            if disk is not None and disk != d.text() and disk != d.baseline:
+                self.conflict = (tab["id"], disk)
+                if not auto:
+                    self.message("File changed on disk — not saved", "error")
+                return False
+        try:
+            atomic_write(path, self._disk_text(d))
+        except OSError as e:
+            self.message("Save failed: %s" % (e.strerror or e), "error")
+            return False
+        d.baseline = d.text()
+        d.disk_sig = file_sig(path)
+        d.last_edit = None
+        self.st.clear_recovery(tab["id"])
+        if self.conflict and self.conflict[0] == tab["id"]:
+            self.conflict = None
+        if not auto:
+            self.message("Saved %s" % shorten_home(path), "ok")
+        tab["lastModified"] = iso_now()
+        self.save_meta()
+        return True
+
+    def save(self):
+        if self.tab.get("isTemporary"):
+            return self.save_as()
+        self.save_file(self.tab, self.doc)
+
+    def save_as(self):
+        tab, d = self.tab, self.doc
+        if tab.get("isTemporary"):
+            title = self.display_title(tab)
+            name = re.sub(r"[/\x00]", "-", title).strip() or "note"
+            if "." not in name:
+                name += ".txt"
+            default = os.path.join(shorten_home(self.cwd), name)
+        else:
+            default = shorten_home(tab["filePath"])
+
+        def write(path):
+            try:
+                atomic_write(path, self._disk_text(d))
+            except OSError as e:
+                return self.message("Save failed: %s" % (e.strerror or e), "error")
+            if tab.get("isTemporary"):
+                try:
+                    os.unlink(self.st.full_path(tab))
+                except OSError:
+                    pass
+            self.st.clear_recovery(tab["id"])
+            tab.update(title=os.path.basename(path), filePath=path, isTemporary=False, lastModified=iso_now())
+            d.baseline = d.text()
+            d.disk_sig = file_sig(path)
+            d.last_edit = None
+            self.title_cache.pop(tab["id"], None)
+            self.save_meta()
+            self.message("Saved %s" % shorten_home(path), "ok")
+            self.set_terminal_title()
+
+        def done(text):
+            if not text.strip():
+                return
+            path = expand_path(text, self.cwd)
+            if os.path.isdir(path):
+                return self.message("%s is a directory" % shorten_home(path), "error")
+            if os.path.exists(path) and path != tab.get("filePath"):
+                return self.ask("%s exists. Overwrite? [y/N]" % shorten_home(path), {"y": lambda: write(path)})
+            write(path)
+        self.ask_text("Save as:", default, done, complete=True)
+
+    def open_file(self):
+        def done(text):
+            if text.strip():
+                self.open_path(expand_path(text, self.cwd))
+        self.ask_text("Open:", shorten_home(self.cwd) + os.sep, done, complete=True)
+
+    def open_path(self, path, quiet=False):
+        path = os.path.abspath(path)
+        if os.path.isdir(path):
+            return self.message("%s is a directory" % shorten_home(path), "error")
+        for i, t in enumerate(self.tabs):
+            if not t.get("isTemporary") and t.get("filePath") == path:
+                self.switch(i)
+                return
+        if self.tabs:
+            self.flush(self.tab)
+            self.remember_cursor(self.tab)
+        self.tabs.append(self.st.make_file_tab(path))
+        self.cur = len(self.tabs) - 1
+        self.save_meta()
+        if not quiet:
+            self.message(("Opened " if os.path.exists(path) else "New file ") + shorten_home(path), "ok")
+        self.set_terminal_title()
+
+    # ---------------- external changes ----------------
+
+    def check_disk(self, tab):
+        d = self.docs.get(tab["id"])
+        if not d:
+            return
+        path = self.st.full_path(tab)
+        sig = file_sig(path)
+        if sig is None or sig == d.disk_sig:
+            return
+        try:
+            disk, crlf = read_text(path)
+        except OSError:
+            return
+        d.disk_sig = sig
+        # Same decision table as DMS's applyDiskContent()
+        if disk == d.text():
+            d.baseline = disk
+        elif disk == d.baseline:
+            pass
+        elif not d.modified():
+            d.set_text_undoable(disk)
+            d.baseline = disk
+            d.last_edit = None
+            d.crlf = crlf
+            if not tab.get("isTemporary"):
+                self.message("Reloaded (changed on disk)")
+        else:
+            self.conflict = (tab["id"], disk)
+
+    def resolve_conflict(self, reload):
+        if not self.conflict or self.conflict[0] != self.tab["id"]:
+            return self.message("No conflict")
+        disk = self.conflict[1]
+        self.conflict = None
+        d = self.doc
+        if reload:
+            d.set_text_undoable(disk)
+            d.baseline = disk
+            d.last_edit = None
+            self.st.clear_recovery(self.tab["id"])
+            self.message("Reloaded from disk (Ctrl+Z restores your edits)")
+        elif self.tab.get("isTemporary"):
+            self.save_note(self.tab, d)
+        else:
+            self.save_file(self.tab, d, force=True)
+
+    # ---------------- periodic work ----------------
+
+    def tick(self):
+        now = time.monotonic()
+        delay = float(self.cfg.get("autosave_delay", 2.0) or 2.0)
+        for tab in self.tabs:
+            d = self.docs.get(tab["id"])
+            if d and d.last_edit is not None and now - d.last_edit >= delay:
+                if tab.get("isTemporary"):
+                    d.last_edit = None
+                    if d.modified():
+                        self.save_note(tab, d)
+                elif self.cfg.get("auto_save_files"):
+                    d.last_edit = None
+                    if d.modified():
+                        self.save_file(tab, d, auto=True)
+                else:
+                    d.last_edit = None
+        if now - self.last_poll >= 1.0:
+            self.last_poll = now
+            self.sync_meta()
+            if self.tabs:
+                self.check_disk(self.tab)
+
+    def shutdown(self):
+        """Persist everything. Safe to call from a signal-triggered exit (no UI)."""
+        if self.shut_down:
+            return
+        self.shut_down = True
+        for tab in self.tabs:
+            d = self.docs.get(tab["id"])
+            if not d:
+                continue
+            try:
+                if tab.get("isTemporary"):
+                    if d.modified():
+                        self.save_note(tab, d, meta=False)
+                elif d.modified():
+                    if not (self.cfg.get("auto_save_files") and self.save_file(tab, d, auto=True)):
+                        self.st.save_recovery(tab, d.text(), d.baseline)
+                else:
+                    self.st.clear_recovery(tab["id"])
+            except OSError:
+                pass
+            self.remember_cursor(tab)
+        try:
+            self.st.save_meta(self.tabs, self.cur)
+        except OSError:
+            pass
+
+    # ---------------- UI helpers ----------------
+
+    def message(self, text, level="info"):
+        self.msg = (text, level, time.monotonic() + (6 if level == "error" else 3))
+
+    def ask(self, question, handlers):
+        self.mode = "confirm"
+        self.confirm = (question, handlers)
+
+    def ask_text(self, label, initial, on_done, complete=False):
+        self.mode = "prompt"
+        self.prompt = {"label": label, "input": LineInput(initial), "done": on_done, "complete": complete}
+
+    def set_terminal_title(self):
+        try:
+            title = "Notepad — %s" % self.display_title(self.tab)
+            os.write(sys.stdout.fileno(), ("\x1b]2;%s\x07" % title.replace("\x07", "")).encode("utf-8", "replace"))
+        except (OSError, IndexError):
+            pass
+
+    def display_title(self, tab):
+        title = tab.get("title") or UNTITLED
+        if not (tab.get("isTemporary") and title == UNTITLED and self.cfg.get("auto_title", True)):
+            return title
+        d = self.docs.get(tab["id"])
+        if d is not None:
+            key = ("doc", d.version)
+            cached = self.title_cache.get(tab["id"])
+            if cached and cached[0] == key:
+                return cached[1]
+            first = next((l.strip() for l in d.lines[:200] if l.strip()), "")
+        else:
+            path = self.st.full_path(tab)
+            key = ("file", file_sig(path))
+            cached = self.title_cache.get(tab["id"])
+            if cached and cached[0] == key:
+                return cached[1]
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    head = f.read(2000)
+            except OSError:
+                head = ""
+            first = next((l.strip() for l in head.split("\n") if l.strip()), "")
+        first = re.sub(r"^#+\s*", "", first)
+        result = first[:40] if first else UNTITLED
+        self.title_cache[tab["id"]] = (key, result)
+        return result
+
+    # ---------------- wrapping & geometry ----------------
+
+    def wrap(self, line):
+        w, tw = self.text_w, self.cfg.get("tab_width", 4) or 4
+        key = (line, w, tw)
+        r = self.wrap_cache.get(key)
+        if r is not None:
+            return r
+        starts = [0]
+        x, seg, brk = 0, 0, None
+        i, n = 0, len(line)
+        while i < n:
+            ch = line[i]
+            cw = (tw - x % tw) if ch == "\t" else char_width(ch)
+            if x + cw > w and i > seg:
+                b = brk if (brk is not None and brk > seg) else i
+                starts.append(b)
+                seg, brk, x = b, None, 0
+                for j in range(b, i):
+                    cj = line[j]
+                    x += (tw - x % tw) if cj == "\t" else char_width(cj)
+                continue
+            x += cw
+            if ch in " \t":
+                brk = i + 1
+            i += 1
+        if len(self.wrap_cache) > 20000:
+            self.wrap_cache.clear()
+        self.wrap_cache[key] = starts
+        return starts
+
+    def seg_bounds(self, d, l, s):
+        starts = self.wrap(d.lines[l])
+        end = starts[s + 1] if s + 1 < len(starts) else len(d.lines[l])
+        return starts[s], end, s + 1 == len(starts)
+
+    def x_of(self, line, start, col):
+        tw, x = self.cfg.get("tab_width", 4) or 4, 0
+        for i in range(start, col):
+            ch = line[i]
+            x += (tw - x % tw) if ch == "\t" else char_width(ch)
+        return x
+
+    def col_at(self, d, l, s, target):
+        line = d.lines[l]
+        start, end, last = self.seg_bounds(d, l, s)
+        tw, x = self.cfg.get("tab_width", 4) or 4, 0
+        for i in range(start, end):
+            ch = line[i]
+            cw = (tw - x % tw) if ch == "\t" else char_width(ch)
+            if x + cw > target:
+                return i
+            x += cw
+        return end if last else max(start, end - 1)
+
+    def vis(self, d, p):
+        starts = self.wrap(d.lines[p[0]])
+        s = bisect_right(starts, p[1]) - 1
+        return p[0], s, self.x_of(d.lines[p[0]], starts[s], p[1])
+
+    def back(self, d, l, s, n):
+        while n > 0:
+            if s > 0:
+                step = min(s, n)
+                s -= step
+                n -= step
+            elif l > 0:
+                l -= 1
+                s = len(self.wrap(d.lines[l])) - 1
+                n -= 1
+            else:
+                break
+        return l, s
+
+    def fwd(self, d, l, s, n):
+        while n > 0:
+            k = len(self.wrap(d.lines[l]))
+            if s + 1 < k:
+                step = min(k - 1 - s, n)
+                s += step
+                n -= step
+            elif l + 1 < len(d.lines):
+                l, s = l + 1, 0
+                n -= 1
+            else:
+                break
+        return l, s
+
+    def clamp_top(self, d):
+        l = max(0, min(d.top[0], len(d.lines) - 1))
+        s = max(0, min(d.top[1], len(self.wrap(d.lines[l])) - 1))
+        d.top = (l, s)
+
+    def ensure_visible(self, d, h):
+        cl, cs, _ = self.vis(d, d.cur)
+        tl, ts = d.top
+        if (cl, cs) < (tl, ts):
+            d.top = (cl, cs)
+            return
+        rows, l, s = 0, tl, ts
+        while l < cl and rows < h:
+            rows += len(self.wrap(d.lines[l])) - s
+            s = 0
+            l += 1
+        rows += cs - s
+        if rows >= h:
+            d.top = self.back(d, cl, cs, h - 1)
+
+    def screen_to_pos(self, d, y, x):
+        row = max(0, y - self.edit_y0)
+        l, s = d.top
+        for _ in range(row):
+            nl, ns = self.fwd(d, l, s, 1)
+            if (nl, ns) == (l, s):
+                return d.end()           # clicked below the last line
+            l, s = nl, ns
+        return (l, self.col_at(d, l, s, max(0, x - self.gutter)))
+
+    def _last_vis(self, d):
+        l = len(d.lines) - 1
+        return l, len(self.wrap(d.lines[l])) - 1
+
+    # ---------------- drawing ----------------
+
+    def put(self, y, x, s, attr=0):
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except curses.error:
+            pass
+
+    def fill(self, y, x, w, attr):
+        if w > 0:
+            self.put(y, x, " " * w, attr)
+
+    def draw(self):
+        scr = self.scr
+        H, W = scr.getmaxyx()
+        scr.erase()
+        self.regions = []
+        self.cursor_screen = None
+        if H < 4 or W < 20:
+            self.put(0, 0, "Window too small"[:W - 1])
+            scr.refresh()
+            return
+        self.draw_tabbar(W)
+        y = 1
+        if self.conflict and self.conflict[0] == self.tab["id"]:
+            self.fill(y, 0, W, self.attr["banner"])
+            self.put(y, 1, clip(" ⚠ Changed on disk:  %s reload from disk  ·  %s keep my edits  ·  Esc dismiss" % (
+                self.keys_for("reload_disk"), self.keys_for("keep_mine")), W - 2), self.attr["banner"])
+            y += 1
+        self.edit_y0 = y
+        self.edit_h = max(1, H - 1 - y)
+        self.draw_editor(W)
+        if self.mode in ("prompt", "find", "confirm"):
+            self.draw_prompt(H - 1, W)
+        else:
+            self.draw_status(H - 1, W)
+        if self.mode == "help":
+            self.draw_help(H, W)
+        if self.cursor_screen and self.mode != "help":
+            try:
+                curses.curs_set(1)
+                scr.move(*self.cursor_screen)
+            except curses.error:
+                pass
+        else:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+        scr.refresh()
+
+    def keys_for(self, action):
+        ks = self.action_keys.get(action) or []
+        return pretty_key(ks[0]) if ks else "(unbound)"
+
+    def tab_label(self, i):
+        tab = self.tabs[i]
+        title = clip(self.display_title(tab), 24)
+        d = self.docs.get(tab["id"])
+        dirty = (not tab.get("isTemporary")) and d is not None and d.modified()
+        return " %s%s " % (title, " ●" if dirty else ""), i == self.cur
+
+    def draw_tabbar(self, W):
+        A = self.attr
+        self.fill(0, 0, W, A["bar"])
+        plus = " + "
+        right_limit = W - len(plus) - 1
+        labels = [self.tab_label(i) for i in range(len(self.tabs))]
+        widths = [text_width(lbl) + (2 if act else 0) for lbl, act in labels]
+        self.tab_first = max(0, min(self.tab_first, self.cur))
+        avail = right_limit - 2
+        while self.tab_first < self.cur and sum(widths[self.tab_first:self.cur + 1]) + (self.cur - self.tab_first) > avail:
+            self.tab_first += 1
+        if self.tab_first > 0:
+            self.put(0, 0, "‹", A["bar_primary"])
+            self.regions.append((0, 0, 1, ("scroll", -1)))
+        x = 1
+        i = self.tab_first
+        while i < len(self.tabs):
+            lbl, active = labels[i]
+            w = widths[i]
+            if x + w > right_limit:
+                if i == self.tab_first:     # a single tab wider than the bar: clip it
+                    lbl = clip(lbl, max(4, right_limit - x - (2 if active else 0)))
+                    w = text_width(lbl) + (2 if active else 0)
+                else:
+                    break
+            attr = A["tab_active"] if active else A["tab"]
+            self.put(0, x, lbl, attr)
+            if active:
+                self.put(0, x + w - 2, "× ", attr)
+                self.regions.append((0, x + w - 2, x + w, ("close", i)))
+            self.regions.append((0, x, x + w, ("tab", i)))
+            x += w + 1
+            i += 1
+        if i < len(self.tabs):
+            self.put(0, right_limit, "›", A["bar_primary"])
+            self.regions.append((0, right_limit, right_limit + 1, ("scroll", 1)))
+        self.put(0, W - len(plus), plus, A["bar_primary"])
+        self.regions.append((0, W - len(plus), W, ("new",)))
+
+    def draw_editor(self, W):
+        d = self.doc
+        A = self.attr
+        h = self.edit_h
+        self.gutter = (len(str(len(d.lines))) + 2) if self.cfg.get("line_numbers") else 0
+        self.gutter = max(self.gutter, 4) if self.gutter else 0
+        self.text_w = max(4, W - self.gutter - 1)
+        self.clamp_top(d)
+        if self.follow:
+            self.ensure_visible(d, h)
+            self.follow = False
+        sel = d.sel()
+        matches = self.match_lines if self.mode == "find" else {}
+        qlen = len(self.find["input"].text) if self.find else 0
+        cl, cs, cx = self.vis(d, d.cur)
+        tw = self.cfg.get("tab_width", 4) or 4
+        l, s = d.top
+        for row in range(h):
+            if l >= len(d.lines):
+                break
+            y = self.edit_y0 + row
+            line = d.lines[l]
+            starts = self.wrap(line)
+            start = starts[s]
+            last = s + 1 == len(starts)
+            end = len(line) if last else starts[s + 1]
+            if self.gutter:
+                num = str(l + 1).rjust(self.gutter - 1) + " " if s == 0 else " " * self.gutter
+                self.put(y, 0, num, A["dim"] if (l != cl) else A["text"] | curses.A_BOLD)
+            line_matches = matches.get(l, ())
+            x = 0
+            run, run_attr, run_x = [], None, 0
+            for i in range(start, end):
+                ch = line[i]
+                o = ord(ch)
+                if ch == "\t":
+                    w = tw - x % tw
+                    disp = " " * w
+                    base = A["text"]
+                elif o < 32 or o == 127:
+                    w, disp, base = 2, "^" + ("?" if o == 127 else chr(o + 64)), A["dim"]
+                elif 0xD800 <= o <= 0xDFFF:
+                    w, disp, base = 1, "�", A["dim"]
+                else:
+                    w, disp, base = char_width(ch), ch, A["text"]
+                if x + w > self.text_w:
+                    break
+                attr = base
+                if sel and sel[0] <= (l, i) < sel[1]:
+                    attr = A["sel"]
+                elif line_matches and any(m <= i < m + qlen for m in line_matches):
+                    attr = A["match"]
+                if attr != run_attr:
+                    if run:
+                        self.put(y, self.gutter + run_x, "".join(run), run_attr)
+                    run, run_attr, run_x = [], attr, x
+                run.append(disp)
+                x += w
+            if run:
+                self.put(y, self.gutter + run_x, "".join(run), run_attr)
+            if last and sel and sel[0] <= (l, len(line)) < sel[1] and x < self.text_w:
+                self.put(y, self.gutter + x, " ", A["sel"])
+            if (l, s) == (cl, cs):
+                self.cursor_screen = (y, self.gutter + min(cx, self.text_w))
+            s += 1
+            if s >= len(starts):
+                l, s = l + 1, 0
+        if len(d.lines) == 1 and not d.lines[0] and self.mode != "find":
+            self.put(self.edit_y0, self.gutter, clip("Start typing your notes here...", self.text_w), A["dim"])
+
+    def save_state(self):
+        tab, d = self.tab, self.doc
+        pending = d.last_edit is not None and (tab.get("isTemporary") or self.cfg.get("auto_save_files"))
+        if pending:
+            return "Saving...", "bar_primary"
+        if tab.get("isTemporary"):
+            return "Auto saved", "ok"
+        return ("Unsaved changes", "warn") if d.modified() else ("Saved", "ok")
+
+    def draw_status(self, y, W):
+        A = self.attr
+        d = self.doc
+        self.fill(y, 0, W, A["bar"])
+        state, sattr = self.save_state()
+        hint = "  %s Help " % self.keys_for("help")
+        right = " " + state + " "
+        rx = W - text_width(right) - text_width(hint) - 1
+        if self.msg and time.monotonic() < self.msg[2]:
+            text, level = self.msg[0], self.msg[1]
+            attr = {"error": A["error"], "warn": A["warn"], "ok": A["ok"]}.get(level, A["bar_primary"])
+            self.put(y, 1, clip(text, max(1, rx - 2)), attr)
+        else:
+            self.msg = None
+            n = len(d.lines)
+            left = "Lines: %d   Ln %d, Col %d" % (n, d.cur[0] + 1, d.cur[1] + 1)
+            sel = d.sel()
+            if sel:
+                left += "   (%d selected)" % len(d.get(*sel))
+            elif d.mark:
+                left += "   MARK"
+            if self.cfg.get("auto_save_files") and not self.tab.get("isTemporary"):
+                left += "   autosave"
+            if self.show_path:
+                left += "   " + shorten_home(self.st.full_path(self.tab))
+            self.put(y, 1, clip(left, max(1, rx - 2)), A["bar"])
+        self.put(y, rx, right, A[sattr])
+        self.put(y, W - text_width(hint) - 1, hint, A["bar_dim"])
+
+    def draw_prompt(self, y, W):
+        A = self.attr
+        self.fill(y, 0, W, A["bar"])
+        if self.mode == "confirm":
+            self.put(y, 1, clip(self.confirm[0], W - 2), A["bar_primary"])
+            return
+        if self.mode == "find":
+            inp = self.find["input"]
+            label = " Find: "
+            count = ("%d/%d" % (self.match_index() + 1, len(self.matches))) if self.matches else \
+                ("no matches" if inp.text else "")
+            info = "  %s   ↑↓ Enter: next · Esc " % count
+            if text_width(info) >= W // 2:
+                info = "  %s " % count
+        else:
+            inp = self.prompt["input"]
+            label = " %s " % self.prompt["label"]
+            info = "  Tab completes · Enter ok · Esc cancel " if self.prompt["complete"] else "  Enter ok · Esc cancel "
+        self.put(y, 0, label, A["bar_primary"])
+        lx = text_width(label)
+        info_w = text_width(info) if text_width(info) < W // 2 else 0
+        field_w = max(4, W - lx - info_w - 1)
+        before = inp.text[:inp.pos]
+        # scroll the field so the cursor stays visible
+        skip = 0
+        while text_width(before[skip:]) > field_w - 1:
+            skip += 1
+        shown = inp.text[skip:]
+        self.put(y, lx, clip(shown, field_w, ""), A["bar"])
+        if info_w:
+            self.put(y, W - info_w - 1, info, A["bar_dim"])
+        self.cursor_screen = (y, lx + text_width(before[skip:]))
+
+    def help_lines(self):
+        sections = [
+            ("Tabs", ["new_tab", "close_tab", "reopen_tab", "next_tab", "prev_tab", "tab_1", "tab_9",
+                      "move_tab_left", "move_tab_right", "rename_tab"]),
+            ("Files", ["save", "save_as", "open", "reload_disk", "keep_mine"]),
+            ("Editing", ["undo", "redo", "select_all", "copy", "cut", "paste", "mark", "delete_line",
+                         "duplicate_line", "move_line_up", "move_line_down", "find", "find_next", "find_prev"]),
+            ("View", ["toggle_line_numbers", "cycle_theme", "toggle_autosave", "toggle_path", "redraw", "help", "quit"]),
+        ]
+        out = []
+        for title, acts in sections:
+            out.append(("title", title, ""))
+            for a in acts:
+                ks = " / ".join(pretty_key(k) for k in self.action_keys.get(a, [])) or "(unbound)"
+                out.append(("row", ks, ACTION_DESC[a]))
+            if title == "Editing":
+                out.append(("row", "Shift+arrows, mouse drag", "Select (or Ctrl+Space, then arrows)"))
+                out.append(("row", "Ctrl+←/→, Alt+Backspace", "Word left/right, delete word"))
+                out.append(("row", "Tab / Shift+Tab", "Indent / outdent selected lines"))
+            out.append(("gap", "", ""))
+        out.append(("dim", "Notes save automatically. Unsaved edits to files are kept across restarts.", ""))
+        out.append(("dim", "Storage: %s   Config: %s" % (shorten_home(self.st.base), shorten_home(CONFIG_PATH)), ""))
+        return out
+
+    def draw_help(self, H, W):
+        A = self.attr
+        lines = self.help_lines()
+        bw = min(W - 2, 84)
+        bh = min(H - 2, len(lines) + 3)
+        x0, y0 = (W - bw) // 2, (H - bh) // 2
+        visible = bh - 3
+        self.help_scroll = max(0, min(self.help_scroll, len(lines) - visible))
+        for r in range(bh):
+            self.fill(y0 + r, x0, bw, A["box"])
+        more = len(lines) > visible
+        self.put(y0, x0 + 2, clip(" tuinotepad %s — %sany other key closes " % (
+            VERSION, "↑/↓ scroll · " if more else ""), bw - 4), A["box_title"])
+        if more:
+            pct = "%d%%" % (100 * (self.help_scroll + visible) // len(lines))
+            self.put(y0 + bh - 1, x0 + bw - len(pct) - 2, pct, A["box_dim"])
+        kw = min(30, bw // 2 - 2)
+        for i, (kind, a, b) in enumerate(lines[self.help_scroll:self.help_scroll + visible]):
+            y = y0 + 2 + i
+            if kind == "title":
+                self.put(y, x0 + 2, a, A["box_title"])
+            elif kind == "row":
+                self.put(y, x0 + 4, clip(a, kw), A["box_key"])
+                self.put(y, x0 + 5 + kw, clip(b, bw - kw - 7), A["box"])
+            elif kind == "dim":
+                self.put(y, x0 + 2, clip(a, bw - 4), A["box_dim"])
+
+    # ---------------- find ----------------
+
+    def open_find(self):
+        d = self.doc
+        initial = ""
+        sel = d.sel()
+        if sel and sel[0][0] == sel[1][0]:
+            initial = d.get(*sel)
+        self.find = {"input": LineInput(initial), "origin": sel[0] if sel else d.cur}
+        self.mode = "find"
+        self.match_key = None
+        self.update_matches()
+        if initial:
+            self.goto_match(0, from_origin=True)
+
+    def close_find(self):
+        if self.mode == "find":
+            self.mode = None
+        self.find = None
+        self.matches, self.match_lines = [], {}
+
+    def update_matches(self):
+        d = self.doc
+        q = self.find["input"].text if self.find else ""
+        key = (id(d), d.version, q)
+        if key == self.match_key:
+            return
+        self.match_key = key
+        res = []
+        if q:
+            case = any(c.isupper() for c in q)
+            qq = q if case else q.lower()
+            for r, line in enumerate(d.lines):
+                hay = line if case else line.lower()
+                if len(hay) != len(line):       # rare unicode case-folding length change
+                    hay = line
+                i = hay.find(qq)
+                while i >= 0:
+                    res.append((r, i))
+                    i = hay.find(qq, i + max(1, len(qq)))
+        self.matches = res
+        self.match_lines = {}
+        for r, c in res:
+            self.match_lines.setdefault(r, []).append(c)
+
+    def match_index(self):
+        d = self.doc
+        sel = d.sel()
+        p = sel[0] if sel else d.cur
+        i = bisect_right(self.matches, p) - 1
+        return max(0, i)
+
+    def goto_match(self, direction, from_origin=False):
+        self.update_matches()
+        if not self.matches:
+            return
+        d = self.doc
+        sel = d.sel()
+        if from_origin:
+            ref = self.find["origin"]
+            i = next((k for k, m in enumerate(self.matches) if m >= ref), 0)
+        elif direction >= 0:
+            ref = sel[0] if sel else d.cur
+            i = next((k for k, m in enumerate(self.matches) if m > ref), 0)
+        else:
+            ref = sel[0] if sel else d.cur
+            i = next((k for k in range(len(self.matches) - 1, -1, -1) if self.matches[k] < ref), len(self.matches) - 1)
+        r, c = self.matches[i]
+        d.anchor = (r, c)
+        d.cur = (r, c + len(self.find["input"].text))
+        d.mark = False
+        self.follow = True
+
+    def on_find(self, ev):
+        inp = self.find["input"]
+        if ev[0] == "key" and ev[1] in ("down", "f3"):
+            self.goto_match(1)
+            return True
+        if ev[0] == "key" and ev[1] in ("up", "shift+f3"):
+            self.goto_match(-1)
+            return True
+        r = inp.handle(ev)
+        if r == "enter":
+            self.goto_match(1)
+        elif r == "cancel":
+            self.close_find()
+        elif r == "edit":
+            self.update_matches()
+            if inp.text:
+                self.goto_match(0, from_origin=True)
+            else:
+                self.doc.anchor = None
+        elif r is None:
+            return False
+        return True
+
+    # ---------------- event handling ----------------
+
+    def loop(self):
+        last_draw = 0.0
+        need_draw = True
+        while not self.quit and not self.stop_signal:
+            self.tick()
+            now = time.monotonic()
+            if need_draw or now - last_draw > 0.5:
+                self.draw()
+                last_draw = now
+            events = self.input.read(250)
+            need_draw = bool(events)
+            if self.stop_signal:
+                break
+            for ev in events:
+                try:
+                    self.handle(ev)
+                except Exception as e:     # never lose the session over a bug in one action
+                    log_exception()
+                    self.message("Error: %s (logged)" % e, "error")
+                if self.quit:
+                    break
+
+    def handle(self, ev):
+        kind = ev[0]
+        if kind == "resize":
+            try:
+                curses.update_lines_cols()
+            except AttributeError:
+                pass
+            self.follow = True
+            return
+        if kind == "mouse":
+            return self.on_mouse(*ev[1:])
+        self.follow = True
+        if self.mode == "help":
+            step = {"up": -1, "down": 1, "pgup": -10, "pgdn": 10, "home": -999, "end": 999}.get(
+                ev[1] if kind == "key" else {"k": "up", "j": "down"}.get(ev[1] if kind == "char" else ""))
+            if step:
+                self.help_scroll = max(0, self.help_scroll + step)
+            else:
+                self.mode = None
+            return
+        if self.mode == "confirm":
+            if kind == "char" or (kind == "key" and ev[1] in ("esc", "enter")):
+                question, handlers = self.confirm
+                self.mode, self.confirm = None, None
+                fn = handlers.get(ev[1].lower()) if kind == "char" else None
+                if fn:
+                    fn()
+            return
+        if self.mode == "prompt":
+            return self.on_prompt(ev)
+        if self.mode == "find" and self.on_find(ev):
+            return
+        if kind == "paste":
+            return self.insert(ev[1], kind=None)
+        if kind == "char":
+            return self.insert(ev[1], kind="type")
+        name = ev[1]
+        act = self.keymap.get(name)
+        if act:
+            return self.run_action(act)
+        self.edit_key(name)
+
+    def on_prompt(self, ev):
+        p = self.prompt
+        inp = p["input"]
+        if ev[0] == "key" and ev[1] == "tab" and p["complete"]:
+            return self.complete_path(inp)
+        r = inp.handle(ev)
+        if r == "enter":
+            self.mode, self.prompt = None, None
+            p["done"](inp.text)
+        elif r == "cancel":
+            self.mode, self.prompt = None, None
+
+    def complete_path(self, inp):
+        text = inp.text
+        full = os.path.expanduser(text)
+        d, base = os.path.split(full)
+        d = d or "."
+        try:
+            names = sorted(n for n in os.listdir(expand_path(d, self.cwd)) if n.startswith(base)
+                           and (base.startswith(".") or not n.startswith(".")))
+        except OSError:
+            names = []
+        if not names:
+            return self.message("No completions")
+        common = os.path.commonprefix(names)
+        prefix = text[:len(text) - len(base)] if base else text
+        new = prefix + common
+        if len(names) == 1 and os.path.isdir(expand_path(os.path.join(d, common), self.cwd)):
+            new += os.sep
+        inp.text, inp.pos = new, len(new)
+        if len(names) > 1:
+            self.message("  ".join(names[:30]))
+
+    def run_action(self, act):
+        d = self.doc
+        if act.startswith("tab_"):
+            n = int(act[4:])
+            return self.switch(len(self.tabs) - 1 if n == 9 else n - 1)
+        fn = {
+            "new_tab": self.new_tab, "close_tab": self.close_tab, "reopen_tab": self.reopen_tab,
+            "next_tab": lambda: self.switch((self.cur + 1) % len(self.tabs)),
+            "prev_tab": lambda: self.switch((self.cur - 1) % len(self.tabs)),
+            "move_tab_right": lambda: self.move_tab(1), "move_tab_left": lambda: self.move_tab(-1),
+            "rename_tab": self.rename_tab, "save": self.save, "save_as": self.save_as, "open": self.open_file,
+            "find": self.open_find,
+            "find_next": lambda: self.goto_match(1) if self.find else self.open_find(),
+            "find_prev": lambda: self.goto_match(-1) if self.find else self.open_find(),
+            "undo": lambda: d.do_undo() or self.message("Nothing to undo"),
+            "redo": lambda: d.do_redo() or self.message("Nothing to redo"),
+            "select_all": self.select_all, "copy": lambda: self.copy(False), "cut": lambda: self.copy(True),
+            "paste": lambda: self.insert(self.clip.paste(), kind=None), "mark": self.toggle_mark,
+            "delete_line": self.delete_line, "duplicate_line": self.duplicate_line,
+            "move_line_up": lambda: self.move_lines(-1), "move_line_down": lambda: self.move_lines(1),
+            "toggle_line_numbers": lambda: self.toggle("line_numbers", "Line numbers"),
+            "toggle_autosave": lambda: self.toggle("auto_save_files", "Autosave for opened files"),
+            "cycle_theme": self.cycle_theme, "toggle_path": self.toggle_path,
+            "reload_disk": lambda: self.resolve_conflict(True), "keep_mine": lambda: self.resolve_conflict(False),
+            "help": self.show_help, "redraw": self.redraw, "quit": self.request_quit,
+        }.get(act)
+        if fn:
+            fn()
+
+    def show_help(self):
+        self.mode = "help"
+        self.help_scroll = 0
+
+    def redraw(self):
+        self.scr.clear()
+        self.wrap_cache.clear()
+
+    def request_quit(self):
+        self.quit = True
+
+    def toggle(self, key, label):
+        self.cfg[key] = not self.cfg.get(key)
+        save_config(self.cfg)
+        self.message("%s %s" % (label, "on" if self.cfg[key] else "off"))
+
+    def toggle_path(self):
+        self.show_path = not self.show_path
+
+    def cycle_theme(self):
+        cur = self.cfg.get("theme", "purple")
+        order = [t for t in THEME_ORDER if t != "dms" or os.path.exists(DMS_COLORS)]
+        nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else order[0]
+        self.cfg["theme"] = nxt
+        save_config(self.cfg)
+        self.setup_colors()
+        self.message("Theme: %s" % nxt)
+
+    def toggle_mark(self):
+        d = self.doc
+        if d.mark:
+            d.mark, d.anchor = False, None
+        else:
+            d.mark, d.anchor = True, d.cur
+
+    def select_all(self):
+        d = self.doc
+        d.anchor, d.cur, d.mark = (0, 0), d.end(), False
+
+    def copy(self, cut):
+        d = self.doc
+        sel = d.sel()
+        if not sel:
+            return self.message("Nothing selected")
+        where = self.clip.copy(d.get(*sel))
+        if cut:
+            d.replace(sel[0], sel[1], "")
+        self.message(("Cut" if cut else "Copied") + " to " + where)
+
+    def insert(self, text, kind=None):
+        if not text:
+            return
+        d = self.doc
+        sel = d.sel()
+        if sel:
+            d.replace(sel[0], sel[1], text, kind=None)
+        else:
+            d.anchor, d.mark = None, False
+            d.replace(d.cur, d.cur, text, kind=kind)
+
+    def delete_line(self):
+        d = self.doc
+        r = d.cur[0]
+        if len(d.lines) == 1:
+            d.replace((0, 0), d.end(), "")
+        elif r + 1 < len(d.lines):
+            d.replace((r, 0), (r + 1, 0), "")
+            d.cur = d.clamp((r, d.cur[1]))
+        else:
+            d.replace((r - 1, len(d.lines[r - 1])), (r, len(d.lines[r])), "")
+
+    def duplicate_line(self):
+        d = self.doc
+        r, c = d.cur
+        d.replace((r, 0), (r, 0), d.lines[r] + "\n")
+        d.cur = (r + 1, c)
+
+    def sel_lines(self):
+        d = self.doc
+        sel = d.sel()
+        if not sel:
+            return d.cur[0], d.cur[0]
+        r1, r2 = sel[0][0], sel[1][0]
+        if sel[1][1] == 0 and r2 > r1:
+            r2 -= 1
+        return r1, r2
+
+    def move_lines(self, delta):
+        d = self.doc
+        r1, r2 = self.sel_lines()
+        if (delta < 0 and r1 == 0) or (delta > 0 and r2 >= len(d.lines) - 1):
+            return
+        anchor, cur = d.anchor, d.cur
+        block = d.lines[r1:r2 + 1]
+        if delta < 0:
+            other = d.lines[r1 - 1]
+            d.replace((r1 - 1, 0), (r2, len(d.lines[r2])), "\n".join(block + [other]))
+        else:
+            other = d.lines[r2 + 1]
+            d.replace((r1, 0), (r2 + 1, len(d.lines[r2 + 1])), "\n".join([other] + block))
+        shift = lambda p: (p[0] + delta, p[1]) if p else None
+        d.cur = d.clamp(shift(cur))
+        d.anchor = d.clamp(shift(anchor)) if anchor else None
+
+    def indent(self, out):
+        d = self.doc
+        r1, r2 = self.sel_lines()
+        had_sel = d.sel() is not None
+        cur = d.cur
+        tabw = self.cfg.get("tab_width", 4) or 4
+        shift_cur = 0
+        d.begin_group()
+        for r in range(r1, r2 + 1):
+            line = d.lines[r]
+            if out:
+                n = 1 if line.startswith("\t") else min(len(line) - len(line.lstrip(" ")), tabw)
+                if n:
+                    d.replace((r, 0), (r, n), "")
+                    shift_cur = -n if r == cur[0] else shift_cur
+            elif line or not had_sel:
+                d.replace((r, 0), (r, 0), "\t")
+                shift_cur = 1 if r == cur[0] else shift_cur
+        d.end_group()
+        if had_sel:
+            d.anchor, d.cur = (r1, 0), (r2, len(d.lines[r2]))
+        else:
+            d.cur = d.clamp((cur[0], max(0, cur[1] + shift_cur)))
+
+    # ---------------- movement & editing keys ----------------
+
+    def word_left(self, d, p):
+        r, c = p
+        if c == 0:
+            return (r - 1, len(d.lines[r - 1])) if r > 0 else p
+        line = d.lines[r]
+        while c > 0 and line[c - 1].isspace():
+            c -= 1
+        if c > 0 and is_word(line[c - 1]):
+            while c > 0 and is_word(line[c - 1]):
+                c -= 1
+        else:
+            while c > 0 and not is_word(line[c - 1]) and not line[c - 1].isspace():
+                c -= 1
+        return (r, c)
+
+    def word_right(self, d, p):
+        r, c = p
+        line = d.lines[r]
+        if c >= len(line):
+            return (r + 1, 0) if r + 1 < len(d.lines) else p
+        while c < len(line) and line[c].isspace():
+            c += 1
+        if c < len(line) and is_word(line[c]):
+            while c < len(line) and is_word(line[c]):
+                c += 1
+        else:
+            while c < len(line) and not is_word(line[c]) and not line[c].isspace():
+                c += 1
+        return (r, c)
+
+    def vertical(self, d, rows):
+        l, s, x = self.vis(d, d.cur)
+        if d.want_x is not None:
+            x = d.want_x
+        if rows < 0:
+            if (l, s) == (0, 0):
+                return (0, 0), x
+            l, s = self.back(d, l, s, -rows)
+        else:
+            if (l, s) == self._last_vis(d):
+                return d.end(), x
+            l, s = self.fwd(d, l, s, rows)
+        return (l, self.col_at(d, l, s, x)), x
+
+    def edit_key(self, name):
+        d = self.doc
+        parts = name.split("+")
+        base = parts[-1]
+        shift = "shift" in parts
+        ctrl = "ctrl" in parts
+        alt = "alt" in parts
+        movement = base in ("left", "right", "up", "down", "home", "end", "pgup", "pgdn")
+        if movement and not alt:
+            extend = shift or d.mark
+            sel = d.sel()
+            want_x = None
+            if base in ("left", "right") and sel and not extend and not ctrl:
+                new = sel[0] if base == "left" else sel[1]
+            elif base == "left":
+                new = self.word_left(d, d.cur) if ctrl else (
+                    (d.cur[0], d.cur[1] - 1) if d.cur[1] > 0 else
+                    ((d.cur[0] - 1, len(d.lines[d.cur[0] - 1])) if d.cur[0] > 0 else d.cur))
+            elif base == "right":
+                new = self.word_right(d, d.cur) if ctrl else (
+                    (d.cur[0], d.cur[1] + 1) if d.cur[1] < len(d.lines[d.cur[0]]) else
+                    ((d.cur[0] + 1, 0) if d.cur[0] + 1 < len(d.lines) else d.cur))
+            elif base in ("up", "down"):
+                if ctrl:                                   # scroll view without moving the cursor
+                    l, s = d.top
+                    d.top = self.back(d, l, s, 1) if base == "up" else self.fwd(d, l, s, 1)
+                    self.follow = False
+                    return
+                new, want_x = self.vertical(d, -1 if base == "up" else 1)
+            elif base in ("pgup", "pgdn"):
+                n = max(1, self.edit_h - 1)
+                new, want_x = self.vertical(d, -n if base == "pgup" else n)
+                l, s = d.top
+                d.top = self.back(d, l, s, n) if base == "pgup" else self.fwd(d, l, s, n)
+            elif base == "home":
+                if ctrl:
+                    new = (0, 0)
+                else:
+                    line = d.lines[d.cur[0]]
+                    indent = len(line) - len(line.lstrip())
+                    new = (d.cur[0], indent if d.cur[1] != indent else 0)
+            else:  # end
+                new = d.end() if ctrl else (d.cur[0], len(d.lines[d.cur[0]]))
+            if extend:
+                if d.anchor is None:
+                    d.anchor = d.cur
+            else:
+                d.anchor = None
+            d.cur = new
+            d.want_x = want_x
+            d.merge_ok = False
+            return
+        if base == "esc":
+            if self.conflict and self.conflict[0] == self.tab["id"]:
+                self.conflict = None
+            elif d.sel() or d.mark:
+                d.anchor, d.mark = None, False
+            elif self.cfg.get("escape_hides_yakuake"):
+                toggle_yakuake()
+            return
+        sel = d.sel()
+        if base == "backspace":
+            if sel:
+                d.replace(sel[0], sel[1], "")
+            elif alt or ctrl:
+                d.replace(self.word_left(d, d.cur), d.cur, "")
+            elif d.cur != (0, 0):
+                r, c = d.cur
+                prev = (r, c - 1) if c > 0 else (r - 1, len(d.lines[r - 1]))
+                d.replace(prev, d.cur, "", kind="bs")
+            return
+        if base == "delete":
+            if sel:
+                d.replace(sel[0], sel[1], "")
+            elif ctrl or alt:
+                d.replace(d.cur, self.word_right(d, d.cur), "")
+            else:
+                r, c = d.cur
+                nxt = (r, c + 1) if c < len(d.lines[r]) else ((r + 1, 0) if r + 1 < len(d.lines) else d.cur)
+                d.replace(d.cur, nxt, "", kind="del")
+            return
+        if base == "enter" and not (ctrl or alt):
+            return self.insert("\n")
+        if base == "tab" and not (ctrl or alt):
+            if shift:
+                return self.indent(True)
+            if sel and sel[0][0] != sel[1][0]:
+                return self.indent(False)
+            return self.insert("\t", kind="type")
+
+    def on_mouse(self, x, y, b):
+        K = curses
+        wheel_up = b & K.BUTTON4_PRESSED
+        wheel_down = b & getattr(K, "BUTTON5_PRESSED", 0x200000)
+        if self.mode == "help":
+            if b & (K.BUTTON1_PRESSED | K.BUTTON1_CLICKED):
+                self.mode = None
+            return
+        if y == 0:
+            if wheel_up or wheel_down:
+                return self.switch((self.cur + (-1 if wheel_up else 1)) % len(self.tabs))
+            if not b & (K.BUTTON1_PRESSED | K.BUTTON1_CLICKED | K.BUTTON2_PRESSED | K.BUTTON2_CLICKED):
+                return
+            middle = b & (K.BUTTON2_PRESSED | K.BUTTON2_CLICKED)
+            for ry, x0, x1, action in self.regions:
+                if ry == 0 and x0 <= x < x1:
+                    if action[0] == "close" and not middle:
+                        return self.close_tab(action[1])
+                    if action[0] == "tab":
+                        if middle:
+                            return self.close_tab(action[1])
+                        now = time.monotonic()
+                        if self.last_click[1] == ("tab", action[1]) and now - self.last_click[0] < 0.4:
+                            self.last_click = (0.0, None, 0)
+                            self.switch(action[1])
+                            return self.rename_tab()
+                        self.last_click = (now, ("tab", action[1]), 1)
+                        return self.switch(action[1])
+                    if action[0] == "new":
+                        return self.new_tab()
+                    if action[0] == "scroll":
+                        return self.switch(max(0, min(len(self.tabs) - 1, self.cur + action[1])))
+            return
+        if self.mode in ("prompt", "confirm"):
+            return
+        d = self.doc
+        if wheel_up or wheel_down:
+            l, s = d.top
+            d.top = self.back(d, l, s, 3) if wheel_up else self.fwd(d, l, s, 3)
+            self.follow = False
+            return
+        if not (self.edit_y0 <= y < self.edit_y0 + self.edit_h):
+            return
+        pos = self.screen_to_pos(d, y, x)
+        clicked = b & (K.BUTTON1_CLICKED | K.BUTTON1_DOUBLE_CLICKED | K.BUTTON1_TRIPLE_CLICKED)
+        if b & K.BUTTON1_DOUBLE_CLICKED:
+            self.last_click = (time.monotonic(), pos, 1)
+        elif b & K.BUTTON1_TRIPLE_CLICKED:
+            self.last_click = (time.monotonic(), pos, 2)
+        if b & K.BUTTON1_PRESSED or clicked:
+            if self.mode == "find":
+                self.close_find()
+            now = time.monotonic()
+            t, where, count = self.last_click
+            count = count + 1 if (where == pos and now - t < 0.4) else 1
+            self.last_click = (now, pos, count)
+            d.mark, d.merge_ok, d.want_x = False, False, None
+            if count == 2:
+                line = d.lines[pos[0]]
+                a = b2 = pos[1]
+                while a > 0 and is_word(line[a - 1]):
+                    a -= 1
+                while b2 < len(line) and is_word(line[b2]):
+                    b2 += 1
+                d.anchor, d.cur = (pos[0], a), (pos[0], b2)
+                self.dragging = False
+            elif count >= 3:
+                d.anchor, d.cur = (pos[0], 0), (pos[0], len(d.lines[pos[0]]))
+                self.dragging = False
+            else:
+                d.anchor, d.cur = pos, pos
+                self.dragging = not clicked
+                if clicked:
+                    d.anchor = None
+        elif b & K.REPORT_MOUSE_POSITION:
+            # Only sent while a button is held (mode 1002). If ncurses merged away the
+            # press (fast input), start the drag here.
+            if not self.dragging:
+                self.dragging = True
+                if d.anchor is None:
+                    d.anchor = d.cur if self.last_click[1] == d.cur else pos
+            d.cur = pos
+            self.follow = True
+        elif b & K.BUTTON1_RELEASED:
+            if self.dragging:
+                d.cur = pos
+            self.dragging = False
+            if d.anchor == d.cur:
+                d.anchor = None
+
+
+def to256(h):
+    r, g, b = int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
+    cube = [0, 95, 135, 175, 215, 255]
+    near = lambda v: min(range(6), key=lambda i: abs(cube[i] - v))
+    ri, gi, bi = near(r), near(g), near(b)
+    cdist = (cube[ri] - r) ** 2 + (cube[gi] - g) ** 2 + (cube[bi] - b) ** 2
+    avg = (r + g + b) // 3
+    gray = max(0, min(23, round((avg - 8) / 10)))
+    gv = 8 + 10 * gray
+    gdist = (gv - r) ** 2 + (gv - g) ** 2 + (gv - b) ** 2
+    return 232 + gray if gdist < cdist else 16 + 36 * ri + 6 * gi + bi
+
+
+def toggle_yakuake():
+    for exe in ("qdbus", "qdbus6", "qdbus-qt6", "qdbus-qt5"):
+        if shutil.which(exe):
+            try:
+                subprocess.Popen([exe, "org.kde.yakuake", "/yakuake/window", "toggleWindowState"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+            return
+
+
+LOG_PATH = os.path.join(DEFAULT_DIR, "tuinotepad.log")
+
+
+def log_exception():
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("--- %s\n%s\n" % (datetime.now().isoformat(), traceback.format_exc()))
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+def run_tui(storage, cfg, cfg_warning, files, stdin_text):
+    os.environ.setdefault("ESCDELAY", "25")
+    cwd = os.getcwd()
+    app = None
+    scr = curses.initscr()
+
+    def on_signal(signum, frame):
+        if app is not None:
+            app.stop_signal = True
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, on_signal)
+
+    try:
+        curses.noecho()
+        curses.raw()
+        scr.keypad(True)
+        if hasattr(curses, "set_escdelay"):
+            curses.set_escdelay(25)
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        curses.mouseinterval(0)
+        os.write(sys.stdout.fileno(), b"\x1b[?2004h\x1b[?1002h")   # bracketed paste, drag reporting
+        app = App(scr, storage, cfg, cfg_warning, files, stdin_text, cwd)
+        app.loop()
+    finally:
+        if app is not None:
+            app.shutdown()
+        try:
+            os.write(sys.stdout.fileno(), b"\x1b[?1002l\x1b[?2004l")
+        except OSError:
+            pass
+        try:
+            curses.endwin()
+        except curses.error:
+            pass
+
+
+HELP_EPILOG = """
+Notes ("Untitled" tabs) are saved automatically, 2s after you stop typing.
+Opened files are saved with Ctrl+S; unsaved edits to them survive quitting.
+Press F1 inside the app for every key. Keys can be rebound in
+%s, e.g.  "keys": {"next_tab": ["alt+right", "ctrl+pgdn"]}
+""" % shorten_home(CONFIG_PATH)
+
+
+def main(argv=None):
+    locale.setlocale(locale.LC_ALL, "")
+    ap = argparse.ArgumentParser(prog=APP, description="A persistent, tabbed notepad for the terminal "
+                                 "(modeled on DankMaterialShell's notepad).", epilog=HELP_EPILOG,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("files", nargs="*", help="files to open in tabs ('-' reads stdin into a new note)")
+    ap.add_argument("--dir", help="storage directory (default: %s)" % shorten_home(DEFAULT_DIR))
+    ap.add_argument("--dms", action="store_true", help="share DankMaterialShell's notepad storage (%s)" % shorten_home(DMS_DIR))
+    ap.add_argument("--new", metavar="TEXT", help="add a note with TEXT ('-' = stdin) and exit; a running instance picks it up")
+    ap.add_argument("--list", action="store_true", help="list tabs and exit")
+    ap.add_argument("--version", action="version", version="%s %s" % (APP, VERSION))
+    args = ap.parse_args(argv)
+
+    cfg, cfg_warning = load_config()
+    base = os.path.abspath(os.path.expanduser(args.dir or os.environ.get("TUINOTEPAD_DIR") or
+                                              (DMS_DIR if args.dms else DEFAULT_DIR)))
+    storage = Storage(base)
+
+    if args.list:
+        res = storage.load_meta()
+        for i, t in enumerate(res[0] if res else []):
+            mark = "*" if res and i == res[1] else " "
+            kind = "note" if t.get("isTemporary") else "file"
+            print("%s %2d  %-30s %s  %s" % (mark, i + 1, t.get("title", UNTITLED), kind, shorten_home(storage.full_path(t))))
+        return 0
+
+    if args.new is not None:
+        text = sys.stdin.read() if args.new == "-" else args.new
+        res = storage.load_meta()
+        tabs, idx = res if res else ([], 0)
+        tab = storage.make_note_tab()
+        atomic_write(storage.full_path(tab), text)
+        tabs.append(tab)
+        storage.save_meta(tabs, idx)
+        print("Added note to %s" % shorten_home(storage.base))
+        return 0
+
+    stdin_text = None
+    files = [f for f in args.files if f != "-"]
+    if "-" in args.files or not sys.stdin.isatty():
+        if not sys.stdin.isatty():
+            stdin_text = sys.stdin.read().replace("\r\n", "\n")
+            try:
+                fd = os.open("/dev/tty", os.O_RDWR)
+                os.dup2(fd, 0)
+                os.close(fd)
+            except OSError:
+                print("%s: no terminal available" % APP, file=sys.stderr)
+                return 1
+    if not sys.stdout.isatty():
+        print("%s: stdout is not a terminal" % APP, file=sys.stderr)
+        return 1
+    try:
+        run_tui(storage, cfg, cfg_warning, files, stdin_text)
+    except Exception:
+        log_exception()
+        traceback.print_exc()
+        print("\n%s crashed; your notes were saved. Details: %s" % (APP, shorten_home(LOG_PATH)), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
