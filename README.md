@@ -26,8 +26,84 @@ standard library, so it works on any distro without a build step.
 
 ## Install
 
+### Requirements
+
+- **Python 3.8 or newer**, including its `curses` module. Most Linux distros
+  and macOS include it. To check:
+  ```sh
+  python3 -c "import curses; print('ok')"
+  ```
+- A terminal with 256 colors. Konsole, Yakuake, Alacritty, kitty, foot, GNOME
+  Terminal and iTerm2 all work.
+- Optional, for Ctrl+C/X/V with the system clipboard: `wl-clipboard` on
+  Wayland, `xclip` or `xsel` on X11. Without these, copying goes through the
+  terminal (OSC 52), or stays inside the app if the terminal doesn't support
+  that.
+
+### Get it
+
 ```sh
-install -Dm755 tuinotepad ~/.local/bin/tuinotepad    # or symlink it
+git clone https://github.com/theunderstated112233/TUINotepad.git
+cd TUINotepad
+```
+
+### Install for your user (no root)
+
+Copy the script onto your `PATH`:
+
+```sh
+install -Dm755 tuinotepad ~/.local/bin/tuinotepad
+```
+
+Or link to it instead, so a `git pull` updates the installed command:
+
+```sh
+mkdir -p ~/.local/bin
+ln -s "$PWD/tuinotepad" ~/.local/bin/tuinotepad
+```
+
+If `tuinotepad` isn't found afterwards, `~/.local/bin` isn't on your `PATH`.
+Add this line to `~/.bashrc` or `~/.zshrc`:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Install system-wide
+
+```sh
+sudo install -Dm755 tuinotepad /usr/local/bin/tuinotepad
+```
+
+### Check it
+
+```sh
+tuinotepad --version
+tuinotepad            # opens with one empty note; press F1 for help
+```
+
+On first run it creates `~/.config/tuinotepad/config.json` and
+`~/.local/state/tuinotepad/`.
+
+### Use it as an always-open notepad in Yakuake
+
+1. Open a new Yakuake tab (Ctrl+Shift+T by default) and run `tuinotepad`.
+2. Optionally rename the tab "Notepad" (double-click the tab title).
+3. Leave it running. Toggling Yakuake (F12) hides and shows it like the DMS
+   slideout, and notes autosave either way.
+
+To launch it in its own window from a desktop shortcut instead:
+
+```sh
+konsole -e tuinotepad      # or: alacritty -e tuinotepad, kitty tuinotepad, ...
+```
+
+### Update and uninstall
+
+```sh
+git pull                              # updates a symlinked install; re-run `install` if you copied it
+rm ~/.local/bin/tuinotepad            # uninstall the command
+rm -r ~/.local/state/tuinotepad ~/.config/tuinotepad   # also delete notes and config
 ```
 
 ## Usage
